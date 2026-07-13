@@ -1,6 +1,6 @@
 {
   "name": "postgres",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "entrypoint": "main.ecko",
   "description": "A PostgreSQL client written in Ecko: v3 wire protocol + SCRAM-SHA-256 over std.net.",
   "author": "Sean Nieuwoudt <sean@underwulf.com>",

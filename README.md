@@ -8,16 +8,19 @@ sub-millisecond.
 ## Install
 
 ```bash
-ecko add https://.../postgres.zip   # or a local path / git URL
+ecko add https://github.com/ecko-sh/postgresql-client
 ```
 
-`ecko add` vendors the package into `./vendor/postgres/` and pins it in
-`ecko.lock`. Grant it the network capability in your `ecko.json`:
+`ecko add` vendors the package into `./vendor/postgres/` and pins it by SHA-256
+in `ecko.lock`. Grant it the network capability in your `ecko.json`:
 
 ```json
 {
   "dependencies": {
-    "postgres": { "source": "...", "grant": ["net"] }
+    "postgres": {
+      "source": "https://github.com/ecko-sh/postgresql-client",
+      "grant": ["net"]
+    }
   }
 }
 ```
