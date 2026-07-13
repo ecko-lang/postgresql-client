@@ -1,0 +1,18 @@
+# Offline tests, run by `ecko test` (no server needed). The full wire protocol
+# is exercised by example.ecko against a live server; here we lock down the
+# trickiest piece that doesn't need a socket: SCRAM's PBKDF2-HMAC-SHA256, tested
+# against the published RFC 6070 / SCRAM vectors.
+import std.test
+import std.encoding
+import "./main.ecko"
+
+test.case("pbkdf2 matches the known SCRAM-SHA-256 vector", || {
+    # PBKDF2-HMAC-SHA256("password", "salt", 4096, dkLen=32)
+    dk = main.pbkdf2(bytes("password"), bytes("salt"), 4096)
+    test.eq(encoding.hex_encode(dk), "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a")
+})
+
+test.case("pbkdf2 at one iteration", || {
+    dk = main.pbkdf2(bytes("password"), bytes("salt"), 1)
+    test.eq(encoding.hex_encode(dk), "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b")
+})

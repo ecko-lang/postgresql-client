@@ -1,0 +1,31 @@
+# A live round-trip against a real PostgreSQL server. Run it directly:
+#
+#   ecko example.ecko
+#
+# (Not part of `ecko test`, which is offline - this needs a running server.)
+# Edit the connection config for your database.
+
+import "./main.ecko"
+
+db = main.connect({ host: "127.0.0.1", port: 5432, user: "testuser", password: "testpwd", database: "testdb" })
+print("connected + authenticated (SCRAM-SHA-256)")
+
+version = get(main.query(db, "select version()")[0], "version")
+print("server -> " + version)
+
+main.query(db, "drop table if exists ecko_example")
+main.query(db, "create table ecko_example (id serial primary key, name text, score int)")
+main.query(db, "insert into ecko_example (name, score) values ('ada', 100), ('grace', 95), ('linus', 88)")
+
+rows = main.query(db, "select name, score from ecko_example order by score desc")
+print("top scores:")
+for (i, r) in enumerate(rows) {
+    print("  " + get(r, "name") + " = " + get(r, "score"))
+}
+
+# NULL comes back as null; text and integers as strings (text format).
+print("missing -> " + string(main.query(db, "select null as n")[0]))
+
+main.query(db, "drop table ecko_example")
+main.close(db)
+print("done")
