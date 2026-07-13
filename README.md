@@ -1,4 +1,4 @@
-# postgres
+# PostgreSQL Client
 
 A PostgreSQL client for [Ecko](https://ecko.sh), written in Ecko. It speaks the v3 wire protocol over `std.net`'s raw sockets and does SCRAM-SHA-256 authentication (Postgres's modern default), built from
 `std.hash`, `bytes`, and the bitwise operators. The PBKDF2 step (4096 rounds
