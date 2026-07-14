@@ -10,7 +10,7 @@ import std.hash
 import std.encoding
 import std.uuid
 
-export { connect, connect_tls, query, close, pbkdf2 }
+export { connect, connect_tls, query, close, pbkdf2, pg_text, build_bind }
 
 # --- big-endian integers ---------------------------------------------------
 
@@ -122,7 +122,14 @@ fn authenticate(sock, user, password) {
                     if code == 12 {
                         # AuthenticationSASLFinal: server signature (trusted).
                         0
-                    } else { error({ kind: "postgres", message: "unsupported auth method (code " + string(code) + ")" }) }
+                    } else {
+                        error(
+                            {
+                                kind: "postgres",
+                                message: "unsupported auth method (code " + string(code) + ")",
+                            },
+                        )
+                    }
                 }
             }
         }
@@ -132,7 +139,15 @@ fn authenticate(sock, user, password) {
 # --- startup + connect -----------------------------------------------------
 
 fn send_startup(sock, user, database) {
-    params = bytes("user") + b"\x00" + bytes(user) + b"\x00" + bytes("database") + b"\x00" + bytes(database) + b"\x00" + b"\x00"
+    params = bytes("user") +
+        b"\x00" +
+        bytes(user) +
+        b"\x00" +
+        bytes("database") +
+        b"\x00" +
+        bytes(database) +
+        b"\x00" +
+        b"\x00"
     body = i32(196608) + params
     net.send(sock, i32(len(body) + 4) + body)
 }
@@ -199,9 +214,10 @@ fn parse_row(payload, cols) {
     row
 }
 
-# query(sock, sql) -> a list of row maps (empty for non-SELECT statements).
-fn query(sock, sql) {
-    send_msg(sock, "Q", bytes(sql) + b"\x00")
+# Read backend messages until ReadyForQuery ('Z'), collecting rows. Shared by
+# the simple and extended query paths (ParseComplete '1' / BindComplete '2' /
+# CommandComplete 'C' / NoData 'n' are read and ignored).
+fn read_results(sock) {
     mut cols = []
     mut rows = []
     mut done = false
@@ -213,4 +229,49 @@ fn query(sock, sql) {
         if msg.tag == "E" { error({ kind: "postgres", message: parse_error(msg.payload) }) }
     }
     rows
+}
+
+# --- parameterized queries (extended protocol) -----------------------------
+# Text format for every param: the value goes out-of-band as a length-prefixed
+# field, NEVER spliced into the SQL, so it can't break out of its slot. That's
+# injection safety by construction - the same guarantee as a `?` placeholder.
+fn pg_text(v) {
+    t = type_of(v)
+    if t == "bool" {
+        if v { "t" } else { "f" }
+    } else if t == "bytes" {
+        "\\x" + encoding.hex_encode(v)
+    } else {
+        string(v)
+    }
+}
+
+# build_bind(params) -> the Bind ('B') message payload: unnamed portal + unnamed
+# statement + 0 param format codes (all text) + Int16 param count + each param
+# (Int32 length, then bytes; length -1 = SQL NULL) + 0 result format codes.
+fn build_bind(params) {
+    mut b = b"\x00" + b"\x00" + i16(0) + i16(len(params))
+    for p in params {
+        if is_null(p) { b = b + b"\xff\xff\xff\xff" } else {
+            pb = bytes(pg_text(p))
+            b = b + i32(len(pb)) + pb
+        }
+    }
+    b + i16(0)
+}
+
+# query(sock, sql) runs a simple text query. query(sock, sql, params) runs the
+# extended protocol with $1..$N placeholders bound out-of-band (injection-safe).
+fn query(sock, sql, params = []) {
+    if len(params) == 0 {
+        send_msg(sock, "Q", bytes(sql) + b"\x00")
+        return read_results(sock)
+    }
+    # Parse: unnamed statement, the SQL, 0 declared param types (server infers).
+    send_msg(sock, "P", b"\x00" + bytes(sql) + b"\x00" + i16(0))
+    send_msg(sock, "B", build_bind(params))
+    send_msg(sock, "D", bytes("P") + b"\x00")  # Describe the portal
+    send_msg(sock, "E", b"\x00" + i32(0))  # Execute, all rows
+    send_msg(sock, "S", b"")  # Sync
+    read_results(sock)
 }

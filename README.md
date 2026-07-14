@@ -40,6 +40,10 @@ for r in rows {                         # rows are maps keyed by column name
     print(get(r, "id") + ": " + get(r, "name"))
 }
 
+# Parameterized query: $1..$N bind out-of-band - injection-safe.
+postgres.query(db, "insert into users (name) values ($1)", ["Ada"])
+me = postgres.query(db, "select * from users where id = $1", [42])
+
 postgres.close(db)
 ```
 
@@ -49,17 +53,31 @@ postgres.close(db)
 |----------|-------|
 | `connect({host, port, user, password, database})` | open + authenticate (SCRAM-SHA-256) |
 | `connect_tls({...})` | same, over TLS |
-| `query(db, sql)` | run a statement; returns a list of row maps (empty for non-SELECT) |
+| `query(db, sql)` | simple text query; returns a list of row maps (empty for non-SELECT) |
+| `query(db, sql, params)` | **parameterized** query with `$1..$N` placeholders — injection-safe |
 | `close(db)` | close the connection |
 | `pbkdf2(password, salt, iters)` | the PBKDF2-HMAC-SHA256 primitive (bonus utility) |
 
 Values come back in text format: integers, text, etc. as strings; SQL
 `NULL` as `null`. Column names are the map keys.
 
-This client implements the simple query protocol only, so statements are sent
-to the server as text. The extended (parameterized) protocol is a planned
-addition. Until then, quote/escape untrusted input yourself or use server-side
-validation.
+### Parameterized queries
+
+Pass a params list and reference them as `$1`, `$2`, … in the SQL. Each value
+is sent to the server **out-of-band** via the extended query protocol (Parse /
+Bind / Execute), so it is never spliced into the SQL text and can't break out
+of its slot — the same injection-safety guarantee as a `?` placeholder:
+
+```ecko
+name = "Robert'); DROP TABLE students;--"
+postgres.query(db, "insert into students (name) values ($1)", [name])
+# stored as a literal string; no tables were harmed
+```
+
+Params bind in text format (integers/floats/strings verbatim, `true`/`false`
+as `t`/`f`, `bytes` as a `\x` bytea literal, `null` as SQL `NULL`); the server
+coerces to each column's type. Without a params list, `query` uses the simple
+protocol as before.
 
 ## Testing
 

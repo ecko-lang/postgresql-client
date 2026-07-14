@@ -9,10 +9,52 @@ import "./main.ecko"
 test.case("pbkdf2 matches the known SCRAM-SHA-256 vector", || {
     # PBKDF2-HMAC-SHA256("password", "salt", 4096, dkLen=32)
     dk = main.pbkdf2(bytes("password"), bytes("salt"), 4096)
-    test.eq(encoding.hex_encode(dk), "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a")
+    test.eq(
+        encoding.hex_encode(dk),
+        "c5e478d59288c841aa530db6845c4c8d962893a001ce4e11a4963873aa98134a",
+    )
 })
 
 test.case("pbkdf2 at one iteration", || {
     dk = main.pbkdf2(bytes("password"), bytes("salt"), 1)
-    test.eq(encoding.hex_encode(dk), "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b")
+    test.eq(
+        encoding.hex_encode(dk),
+        "120fb6cffcf8b32c43e7225256c4f837a86548c92ccc35480805987cb70be17b",
+    )
+})
+
+# --- parameterized query (extended protocol) encoding ----------------------
+
+test.case("pg_text renders scalars in Postgres text format", || {
+    test.eq(main.pg_text(42), "42")
+    test.eq(main.pg_text(3.5), "3.5")
+    test.eq(main.pg_text("hello"), "hello")
+})
+
+test.case("pg_text renders booleans as t/f", || {
+    test.eq(main.pg_text(true), "t")
+    test.eq(main.pg_text(false), "f")
+})
+
+test.case("pg_text passes a quote-laden value through verbatim (no escaping)", || {
+    # Params bind out-of-band, so a value is never parsed as SQL - it needs no
+    # escaping, which is exactly what makes this injection-safe.
+    test.eq(main.pg_text("Robert'); DROP TABLE students;--"), "Robert'); DROP TABLE students;--")
+})
+
+test.case("pg_text renders bytes as a bytea hex literal", || {
+    test.eq(main.pg_text(b"\x00\xff"), "\\x00ff")
+})
+
+test.case("build_bind lays out the extended-protocol Bind message", || {
+    # Bind for one param "ab": portal "" + stmt "" + Int16 0 (text formats) +
+    # Int16 1 (param count) + Int32 2 (len) + "ab" + Int16 0 (result formats).
+    got = main.build_bind(["ab"])
+    test.eq(got, b"\x00\x00\x00\x00\x00\x01\x00\x00\x00\x02ab\x00\x00")
+})
+
+test.case("build_bind encodes a null param as length -1", || {
+    # null -> Int32 0xFFFFFFFF (no value bytes follow).
+    got = main.build_bind([null])
+    test.eq(got, b"\x00\x00\x00\x00\x00\x01\xff\xff\xff\xff\x00\x00")
 })

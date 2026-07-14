@@ -7,7 +7,9 @@
 
 import "./main.ecko"
 
-db = main.connect({ host: "127.0.0.1", port: 5432, user: "testuser", password: "testpwd", database: "testdb" })
+db = main.connect(
+    { host: "127.0.0.1", port: 5432, user: "testuser", password: "testpwd", database: "testdb" },
+)
 print("connected + authenticated (SCRAM-SHA-256)")
 
 version = get(main.query(db, "select version()")[0], "version")
@@ -15,13 +17,30 @@ print("server -> " + version)
 
 main.query(db, "drop table if exists ecko_example")
 main.query(db, "create table ecko_example (id serial primary key, name text, score int)")
-main.query(db, "insert into ecko_example (name, score) values ('ada', 100), ('grace', 95), ('linus', 88)")
 
-rows = main.query(db, "select name, score from ecko_example order by score desc")
-print("top scores:")
+# Parameterized inserts: $1..$N bind out-of-band (injection-safe), so a value
+# is never spliced into the SQL text.
+for (i, row) in enumerate([["ada", 100], ["grace", 95], ["linus", 88]]) {
+    main.query(db, "insert into ecko_example (name, score) values ($1, $2)", row)
+}
+
+rows = main.query(
+    db,
+    "select name, score from ecko_example where score > $1 order by score desc",
+    [90],
+)
+print("scores over 90:")
 for (i, r) in enumerate(rows) {
     print("  " + get(r, "name") + " = " + get(r, "score"))
 }
+
+# A hostile value stays a literal - it can't break out of its slot.
+evil = "x'; drop table ecko_example; --"
+main.query(db, "insert into ecko_example (name, score) values ($1, $2)", [evil, 0])
+print(
+    "stored hostile name verbatim: " +
+        get(main.query(db, "select name from ecko_example where score = $1", [0])[0], "name"),
+)
 
 # NULL comes back as null; text and integers as strings (text format).
 print("missing -> " + string(main.query(db, "select null as n")[0]))
