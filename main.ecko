@@ -10,8 +10,6 @@ import std.hash
 import std.encoding
 import std.uuid
 
-export { connect, connect_tls, query, close, pbkdf2, pg_text, build_bind }
-
 # --- big-endian integers ---------------------------------------------------
 
 fn i32(n) = bytes([n shr 24 band 255, n shr 16 band 255, n shr 8 band 255, n band 255])
@@ -72,7 +70,7 @@ fn parse_error(payload) {
 # --- SCRAM-SHA-256 ----------------------------------------------------------
 
 # PBKDF2-HMAC-SHA256, single 32-byte block (SCRAM's dkLen).
-fn pbkdf2(password, salt, iters) {
+export fn pbkdf2(password, salt, iters) {
     mut u = hash.hmac_sha256_bytes(password, salt + b"\x00\x00\x00\x01")
     mut acc = u
     mut i = 1
@@ -170,9 +168,9 @@ fn handshake(sock, cfg) {
 }
 
 # connect({ host, port, user, password, database }) -> a connection handle.
-fn connect(cfg) = handshake(net.connect(cfg.host, cfg.port), cfg)
-fn connect_tls(cfg) = handshake(net.connect_tls(cfg.host, cfg.port), cfg)
-fn close(sock) = net.close(sock)
+export fn connect(cfg) = handshake(net.connect(cfg.host, cfg.port), cfg)
+export fn connect_tls(cfg) = handshake(net.connect_tls(cfg.host, cfg.port), cfg)
+export fn close(sock) = net.close(sock)
 
 # --- simple query ----------------------------------------------------------
 
@@ -235,7 +233,7 @@ fn read_results(sock) {
 # Text format for every param: the value goes out-of-band as a length-prefixed
 # field, NEVER spliced into the SQL, so it can't break out of its slot. That's
 # injection safety by construction - the same guarantee as a `?` placeholder.
-fn pg_text(v) {
+export fn pg_text(v) {
     t = type_of(v)
     if t == "bool" {
         if v { "t" } else { "f" }
@@ -249,7 +247,7 @@ fn pg_text(v) {
 # build_bind(params) -> the Bind ('B') message payload: unnamed portal + unnamed
 # statement + 0 param format codes (all text) + Int16 param count + each param
 # (Int32 length, then bytes; length -1 = SQL NULL) + 0 result format codes.
-fn build_bind(params) {
+export fn build_bind(params) {
     mut b = b"\x00" + b"\x00" + i16(0) + i16(len(params))
     for p in params {
         if is_null(p) { b = b + b"\xff\xff\xff\xff" } else {
@@ -262,7 +260,7 @@ fn build_bind(params) {
 
 # query(sock, sql) runs a simple text query. query(sock, sql, params) runs the
 # extended protocol with $1..$N placeholders bound out-of-band (injection-safe).
-fn query(sock, sql, params = []) {
+export fn query(sock, sql, params = []) {
     if len(params) == 0 {
         send_msg(sock, "Q", bytes(sql) + b"\x00")
         return read_results(sock)
