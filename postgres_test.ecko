@@ -6,7 +6,7 @@ import std.test
 import std.encoding
 import "./main.ecko"
 
-test.case("pbkdf2 matches the known SCRAM-SHA-256 vector", || {
+test.case("pbkdf2 matches the known SCRAM-SHA-256 vector", fn() {
     # PBKDF2-HMAC-SHA256("password", "salt", 4096, dkLen=32)
     dk = main.pbkdf2(bytes("password"), bytes("salt"), 4096)
     test.eq(
@@ -15,7 +15,7 @@ test.case("pbkdf2 matches the known SCRAM-SHA-256 vector", || {
     )
 })
 
-test.case("pbkdf2 at one iteration", || {
+test.case("pbkdf2 at one iteration", fn() {
     dk = main.pbkdf2(bytes("password"), bytes("salt"), 1)
     test.eq(
         encoding.hex_encode(dk),
@@ -25,35 +25,35 @@ test.case("pbkdf2 at one iteration", || {
 
 # --- parameterized query (extended protocol) encoding ----------------------
 
-test.case("pg_text renders scalars in Postgres text format", || {
+test.case("pg_text renders scalars in Postgres text format", fn() {
     test.eq(main.pg_text(42), "42")
     test.eq(main.pg_text(3.5), "3.5")
     test.eq(main.pg_text("hello"), "hello")
 })
 
-test.case("pg_text renders booleans as t/f", || {
+test.case("pg_text renders booleans as t/f", fn() {
     test.eq(main.pg_text(true), "t")
     test.eq(main.pg_text(false), "f")
 })
 
-test.case("pg_text passes a quote-laden value through verbatim (no escaping)", || {
+test.case("pg_text passes a quote-laden value through verbatim (no escaping)", fn() {
     # Params bind out-of-band, so a value is never parsed as SQL - it needs no
     # escaping, which is exactly what makes this injection-safe.
     test.eq(main.pg_text("Robert'); DROP TABLE students;--"), "Robert'); DROP TABLE students;--")
 })
 
-test.case("pg_text renders bytes as a bytea hex literal", || {
+test.case("pg_text renders bytes as a bytea hex literal", fn() {
     test.eq(main.pg_text(b"\x00\xff"), "\\x00ff")
 })
 
-test.case("build_bind lays out the extended-protocol Bind message", || {
+test.case("build_bind lays out the extended-protocol Bind message", fn() {
     # Bind for one param "ab": portal "" + stmt "" + Int16 0 (text formats) +
     # Int16 1 (param count) + Int32 2 (len) + "ab" + Int16 0 (result formats).
     got = main.build_bind(["ab"])
     test.eq(got, b"\x00\x00\x00\x00\x00\x01\x00\x00\x00\x02ab\x00\x00")
 })
 
-test.case("build_bind encodes a null param as length -1", || {
+test.case("build_bind encodes a null param as length -1", fn() {
     # null -> Int32 0xFFFFFFFF (no value bytes follow).
     got = main.build_bind([null])
     test.eq(got, b"\x00\x00\x00\x00\x00\x01\xff\xff\xff\xff\x00\x00")

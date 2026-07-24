@@ -1,4 +1,4 @@
-# PostgreSQL Client
+# PostgreSQL Client - Ecko Std Lib Package
 
 A PostgreSQL client for [Ecko](https://ecko.sh), written in Ecko. It speaks the v3 wire protocol over `std.net`'s raw sockets and does SCRAM-SHA-256 authentication (Postgres's modern default), built from
 `std.hash`, `bytes`, and the bitwise operators. The PBKDF2 step (4096 rounds
@@ -8,21 +8,32 @@ sub-millisecond.
 ## Install
 
 ```bash
-ecko add https://github.com/ecko-sh/postgresql-client
+ecko get github.com/ecko-sh/postgresql-client
 ```
 
-`ecko add` vendors the package into `./vendor/postgres/` and pins it by SHA-256
-in `ecko.lock`. Grant it the network capability in your `ecko.json`:
+`ecko get` vendors the package under
+`./vendor/github.com/ecko-sh/postgresql-client/` and pins a file-tree hash in
+`ecko.sum`.
+
+`ecko get` records this dependency under the alias `postgresql-client`,
+which isn't a valid import name (hyphens aren't allowed in Ecko
+identifiers). Alias it to `postgres` in your `ecko.json` - this also grants
+the network capability the client needs:
 
 ```json
 {
   "dependencies": {
     "postgres": {
-      "source": "https://github.com/ecko-sh/postgresql-client",
+      "path": "github.com/ecko-sh/postgresql-client",
+      "version": "v0.9.1",
       "grant": ["net"]
     }
   }
 }
+```
+
+```ecko
+import postgres
 ```
 
 ## Use
@@ -54,7 +65,7 @@ postgres.close(db)
 | `connect({host, port, user, password, database})` | open + authenticate (SCRAM-SHA-256) |
 | `connect_tls({...})` | same, over TLS |
 | `query(db, sql)` | simple text query; returns a list of row maps (empty for non-SELECT) |
-| `query(db, sql, params)` | **parameterized** query with `$1..$N` placeholders — injection-safe |
+| `query(db, sql, params)` | **parameterized** query with `$1..$N` placeholders - injection-safe |
 | `close(db)` | close the connection |
 | `pbkdf2(password, salt, iters)` | the PBKDF2-HMAC-SHA256 primitive (bonus utility) |
 
@@ -66,7 +77,7 @@ Values come back in text format: integers, text, etc. as strings; SQL
 Pass a params list and reference them as `$1`, `$2`, … in the SQL. Each value
 is sent to the server **out-of-band** via the extended query protocol (Parse /
 Bind / Execute), so it is never spliced into the SQL text and can't break out
-of its slot — the same injection-safety guarantee as a `?` placeholder:
+of its slot - the same injection-safety guarantee as a `?` placeholder:
 
 ```ecko
 name = "Robert'); DROP TABLE students;--"
