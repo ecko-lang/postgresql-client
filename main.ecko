@@ -84,7 +84,11 @@ export fn pbkdf2(password, salt, iters) {
 
 # Drive the SASL exchange until AuthenticationOk. The intermediate state (our
 # nonce and client-first-bare) is held in mut locals across the R messages.
-fn authenticate(sock, user, password) {
+#
+# No username here on purpose: SCRAM-SHA-256 sends an empty `n=` in the
+# client-first message (RFC 5802 §5.1), because the server already took the
+# user from the startup packet. Passing one in would be dead weight.
+fn authenticate(sock, password) {
     mut client_first_bare = ""
     mut authed = false
     while authed == false {
@@ -162,7 +166,7 @@ fn drain_until_ready(sock) {
 
 fn handshake(sock, cfg) {
     send_startup(sock, cfg.user, cfg.database)
-    authenticate(sock, cfg.user, cfg.password)
+    authenticate(sock, cfg.password)
     drain_until_ready(sock)
     sock
 }
