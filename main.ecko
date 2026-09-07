@@ -6,6 +6,7 @@
 # entrypoint of the `postgres` package; `export` declares its public API.
 
 import std.net
+import std.io
 import std.hash
 import std.encoding
 import std.uuid
@@ -28,14 +29,24 @@ fn read_i16(b, off) = b[off] shl 8 bor b[off + 1]
 # itself but not the type byte) + payload. The startup message has no type.
 
 fn send_msg(sock, typ, payload) {
-    net.send(sock, bytes(typ) + i32(len(payload) + 4) + payload)
+    io.write(sock, bytes(typ) + i32(len(payload) + 4) + payload)
+}
+
+# `io.read_exact` answers null when the peer closed with nothing pending, where
+# the old `net.recv_exact` raised. A backend that goes away mid-conversation is
+# ordinary, so the null becomes the error it used to be here rather than an
+# index into null further down.
+fn read_exact_or_fail(sock, n) {
+    b = io.read_exact(sock, n)
+    if is_null(b) { error({ kind: "postgres", message: "the server closed the connection" }) }
+    b
 }
 
 fn read_msg(sock) {
-    header = net.recv_exact(sock, 5)
+    header = read_exact_or_fail(sock, 5)
     typ = string(header[0..1])
     length = read_i32(header, 1)
-    payload = if length > 4 { net.recv_exact(sock, length - 4) } else { b"" }
+    payload = if length > 4 { read_exact_or_fail(sock, length - 4) } else { b"" }
     { tag: typ, payload: payload }
 }
 
@@ -151,7 +162,7 @@ fn send_startup(sock, user, database) {
         b"\x00" +
         b"\x00"
     body = i32(196608) + params
-    net.send(sock, i32(len(body) + 4) + body)
+    io.write(sock, i32(len(body) + 4) + body)
 }
 
 # Read ParameterStatus/BackendKeyData/... until ReadyForQuery ('Z').
@@ -177,7 +188,7 @@ export fn connect(cfg) = handshake(net.connect(cfg.host, cfg.port), cfg)
 ## `connect`. Needs the `net` capability.
 export fn connect_tls(cfg) = handshake(net.connect_tls(cfg.host, cfg.port), cfg)
 ## Close the connection.
-export fn close(sock) = net.close(sock)
+export fn close(sock) = io.close(sock)
 
 # --- simple query ----------------------------------------------------------
 
