@@ -36,7 +36,7 @@ the network capability the client needs:
 import postgres
 ```
 
-## Use
+## Usage
 
 ```ecko
 import postgres

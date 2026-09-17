@@ -36,10 +36,9 @@ fn send_msg(sock, typ, payload) {
     io.write(sock, bytes(typ) + i32(len(payload) + 4) + payload)
 }
 
-# `io.read_exact` answers null when the peer closed with nothing pending, where
-# the old `net.recv_exact` raised. A backend that goes away mid-conversation is
-# ordinary, so the null becomes the error it used to be here rather than an
-# index into null further down.
+# `io.read_exact` answers null when the peer closed with nothing pending. A
+# backend that goes away mid-conversation is ordinary, so that null is turned
+# into an error here rather than being indexed into further down.
 fn read_exact_or_fail(sock, n) {
     b = io.read_exact(sock, n)
     if is_null(b) { error({ kind: "postgres", message: "the server closed the connection" }) }
