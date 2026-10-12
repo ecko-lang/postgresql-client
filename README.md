@@ -2,30 +2,31 @@
 
 A PostgreSQL client for [Ecko](https://ecko.sh), written in Ecko. It speaks the v3 wire protocol over `std.net`'s raw sockets and does SCRAM-SHA-256 authentication (Postgres's modern default), built from
 `std.hash`, `bytes`, and the bitwise operators. The PBKDF2 step (4096 rounds
-with Postgres's default settings) runs in the interpreter and is still
-sub-millisecond.
+with Postgres's default settings) runs in the interpreter and takes a few
+milliseconds.
 
 ## Install
 
 ```bash
-ecko get github.com/ecko-lang/postgresql-client
+ecko get github.com/ecko-lang/postgresql-client --as postgres
 ```
 
 `ecko get` vendors the package under
 `./vendor/github.com/ecko-lang/postgresql-client/` and pins a file-tree hash in
 `ecko.sum`.
 
-`ecko get` records this dependency under the alias `postgresql-client`,
-which isn't a valid import name (hyphens aren't allowed in Ecko
-identifiers). Alias it to `postgres` in your `ecko.json` - this also grants
-the network capability the client needs:
+Without `--as`, `ecko get` records this dependency under the alias
+`postgresql_client` (the repo name with `-` mapped to `_`); `--as postgres` is what makes
+`import postgres` work. It writes the entry as
+`"postgres": "github.com/ecko-lang/postgresql-client@0.37.0"`. Expand it to the map form in
+your `ecko.json` to grant the network capability the client needs:
 
 ```json
 {
   "dependencies": {
     "postgres": {
       "path": "github.com/ecko-lang/postgresql-client",
-      "version": "v0.9.5",
+      "version": "0.37.0",
       "grant": ["net"]
     }
   }
@@ -48,7 +49,7 @@ db = postgres.connect({
 
 rows = postgres.query(db, "select id, name from users order by id")
 for r in rows {                         # rows are maps keyed by column name
-    print(get(r, "id") + ": " + get(r, "name"))
+    print("{r.id}: {r.name}")
 }
 
 # Parameterized query: $1..$N bind out-of-band - injection-safe.
@@ -67,7 +68,6 @@ postgres.close(db)
 | `query(db, sql)` | simple text query; returns a list of row maps (empty for non-SELECT) |
 | `query(db, sql, params)` | **parameterized** query with `$1..$N` placeholders - injection-safe |
 | `close(db)` | close the connection |
-| `pbkdf2(password, salt, iters)` | the PBKDF2-HMAC-SHA256 primitive (bonus utility) |
 
 Values come back in text format: integers, text, etc. as strings; SQL
 `NULL` as `null`. Column names are the map keys.
