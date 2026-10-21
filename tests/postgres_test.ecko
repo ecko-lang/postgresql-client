@@ -4,6 +4,8 @@
 # against the published RFC 6070 / SCRAM vectors.
 import std.test
 import std.encoding
+import std.io
+import std.net
 import "../client.ecko"
 
 test.case("pbkdf2 matches the known SCRAM-SHA-256 vector", fn() {
@@ -57,4 +59,263 @@ test.case("build_bind encodes a null param as length -1", fn() {
     # null -> Int32 0xFFFFFFFF (no value bytes follow).
     got = client.build_bind([null])
     test.eq(got, b"\x00\x00\x00\x00\x00\x01\xff\xff\xff\xff\x00\x00")
+})
+
+# --- one error kind across the SQL drivers ----------------------------------
+#
+# Every failure this package raises is `kind: "sql"`, the kind std.sql raises,
+# with `driver: "postgres"` to say which database it came from. It used to be
+# `kind: "postgres"`, so code catching database errors had to know the driver.
+
+fn kind_of(f) {
+    try {
+        f()
+        null
+    } catch (e) { { kind: e.kind, driver: get(e, "driver") } }
+}
+
+test.case("errors are kind sql, with the driver named", fn() {
+    test.eq(kind_of(fn() client.statement(42, [])), { kind: "sql", driver: "postgres" })
+})
+
+# --- `?` placeholders, for sql { } blocks -------------------------------------
+#
+# A sql { } block is `{ query, params }` with `?` placeholders. Postgres numbers
+# its own (`$1`), so a block's `?`s are rewritten - but only real placeholders:
+# a `?` in a string, a quoted name, a comment or a dollar-quoted body is text.
+
+test.case("numbered rewrites each ? to the next $n", fn() {
+    test.eq(
+        client.numbered("select * from t where a = ? and b = ?"),
+        { sql: "select * from t where a = $1 and b = $2", count: 2 },
+    )
+})
+
+test.case(
+    "numbered leaves a ? in strings, quoted names and comments alone",
+    fn() {
+        src = "select '?', 'it''s ?', \"col?\", e'\\'?' from t -- why?\n where a = ? /* or ? */"
+        test.eq(
+            client.numbered(src),
+            {
+                sql: "select '?', 'it''s ?', \"col?\", e'\\'?' from t -- why?\n where a = $1 /* or ? */",
+                count: 1,
+            },
+        )
+    },
+)
+
+test.case("numbered leaves a ? in a dollar-quoted body alone", fn() {
+    test.eq(
+        client.numbered("select $$a?b$$, $fn$c?$fn$, ?"),
+        { sql: "select $$a?b$$, $fn$c?$fn$, $1", count: 1 },
+    )
+})
+
+test.case("numbered leaves an existing $1 alone", fn() {
+    test.eq(client.numbered("select $1"), { sql: "select $1", count: 0 })
+})
+
+test.case("a sql block becomes numbered placeholders with its params", fn() {
+    name = "Ada"
+    id = 7
+    got = client.statement(sql { SELECT * FROM users WHERE name = {name} AND id > {id} }, [])
+    test.eq(got, { sql: "SELECT * FROM users WHERE name = $1 AND id > $2", params: ["Ada", 7] })
+})
+
+test.case("a plain string is sent as written, never rewritten", fn() {
+    # The string form already uses $n; a ? in it may be a jsonb operator.
+    got = client.statement("select data ? 'k' from t where id = $1", [3])
+    test.eq(got, { sql: "select data ? 'k' from t where id = $1", params: [3] })
+})
+
+test.case("a sql block with a separate params list is refused", fn() {
+    x = 1
+    test.eq(
+        kind_of(fn() client.statement(sql { SELECT {x} }, [2])),
+        { kind: "sql", driver: "postgres" },
+    )
+})
+
+test.case("a sql block whose ? count does not match its holes is refused", fn() {
+    # The jsonb `?` operator reads as a placeholder; refuse rather than misbind.
+    k = "key"
+    caught = try {
+        client.statement(sql { SELECT data ? 'x' FROM t WHERE k = {k} }, [])
+    } catch (e) {
+        e.message
+    }
+    test.ok(contains(caught, "jsonb"), "should explain the jsonb ? operator: {caught}")
+})
+
+# --- transactions -------------------------------------------------------------
+#
+# transaction(db, fn) behaves like std.sql's: commit when fn returns, roll back
+# and re-raise if it raises, and roll back if the commit itself fails. Driven
+# through in_transaction with a recording stand-in for the connection: `run`
+# takes the statement and returns the server's command tag.
+
+fn recorder(tags) {
+    log = cell([])
+    run = fn(text) {
+        cell_update(log, fn(l) push(l, text))
+        get(tags, text) ?? text
+    }
+    { log: log, run: run }
+}
+
+test.case("a transaction commits and returns what the function returned", fn() {
+    r = recorder({})
+    got = client.in_transaction(r.run, fn() 42)
+    test.eq(got, 42)
+    test.eq(cell_get(r.log), ["BEGIN", "COMMIT"])
+})
+
+test.case("a transaction rolls back and re-raises the function's own error", fn() {
+    r = recorder({})
+    caught = try {
+        client.in_transaction(r.run, fn() error({ kind: "app", message: "no", extra: 1 }))
+    } catch (e) {
+        e
+    }
+    test.eq(caught, { kind: "app", message: "no", extra: 1 })
+    test.eq(cell_get(r.log), ["BEGIN", "ROLLBACK"])
+})
+
+test.case("a commit the server turns into a rollback is an error", fn() {
+    # After a failed statement Postgres aborts the transaction, and COMMIT
+    # answers with the tag ROLLBACK instead of failing. Reporting success there
+    # would claim work was saved when it was thrown away.
+    r = recorder({ COMMIT: "ROLLBACK" })
+    caught = try {
+        client.in_transaction(r.run, fn() 1)
+        null
+    } catch (e) { e }
+    test.eq(caught.kind, "sql")
+    test.eq(caught.driver, "postgres")
+    test.ok(contains(caught.message, "rolled back"), caught.message)
+})
+
+test.case("a commit that fails is rolled back, and its error is the one raised", fn() {
+    log = cell([])
+    run = fn(text) {
+        cell_update(log, fn(l) push(l, text))
+        if text == "COMMIT" {
+            error({ kind: "sql", driver: "postgres", message: "serialization failure" })
+        }
+        text
+    }
+    caught = try {
+        client.in_transaction(run, fn() 1)
+        null
+    } catch (e) { e.message }
+    test.eq(caught, "serialization failure")
+    test.eq(cell_get(log), ["BEGIN", "COMMIT", "ROLLBACK"])
+})
+
+# --- against a scripted server --------------------------------------------------
+#
+# A loopback listener that plays canned backend messages, one reply per query
+# the client sends, so the protocol handling is checked offline. Each reply is
+# the exact bytes a real server sends; the queries it saw come back for
+# asserting on.
+
+fn be32(n) = bytes([n shr 24 band 255, n shr 16 band 255, n shr 8 band 255, n band 255])
+fn be16(n) = bytes([n shr 8 band 255, n band 255])
+fn msg(tag, payload) = bytes(tag) + be32(len(payload) + 4) + payload
+fn cstr(s) = bytes(s) + b"\x00"
+
+fn complete(tag) = msg("C", cstr(tag))
+fn ready() = msg("Z", b"I")
+fn failure(code, text) = msg(
+    "E",
+    b"S" + cstr("ERROR") + b"C" + cstr(code) + b"M" + cstr(text) + b"\x00",
+)
+fn notice(code, text) = msg(
+    "N",
+    b"S" + cstr("WARNING") + b"C" + cstr(code) + b"M" + cstr(text) + b"\x00",
+)
+fn one_row(name, value) {
+    desc = msg("T", be16(1) + cstr(name) + bytes(range(0, 18) |> map(fn(_) 0)))
+    row = msg("D", be16(1) + be32(len(bytes(value))) + bytes(value))
+    desc + row
+}
+
+# Serve `replies` in order, one per client message, and return the query text
+# of each message received.
+async fn scripted(listener, replies) {
+    conn = net.accept(listener, 5000)
+    mut seen = []
+    for reply in replies {
+        header = io.read_exact(conn, 5)
+        n = header[1] shl 24 bor header[2] shl 16 bor header[3] shl 8 bor header[4]
+        body = io.read_exact(conn, n - 4)
+        seen = push(seen, string(body[0..len(body) - 1]))
+        io.write(conn, reply)
+    }
+    io.close(conn)
+    net.stop(listener)
+    seen
+}
+
+fn with_server(replies, work) {
+    l = net.listen(0, "127.0.0.1")
+    server = scripted(l, replies)
+    sock = net.connect("127.0.0.1", net.port(l))
+    out = try { { value: work(sock) } } catch (e) { { error: e } }
+    io.close(sock)
+    insert(out, "seen", await server)
+}
+
+test.case("a failed query leaves the connection ready for the next one", fn() {
+    # The server sends ReadyForQuery after an ErrorResponse. Raising before
+    # reading it left it on the socket, and the next query read it as its own
+    # (empty) reply.
+    got = with_server(
+        [
+            failure("42P01", "relation \"nope\" does not exist") + ready(),
+            one_row("x", "1") + complete("SELECT 1") + ready(),
+        ],
+        fn(db) {
+            first = try { client.query(db, "select * from nope") } catch (e) { e }
+            { first: first, second: client.query(db, "select 1 as x") }
+        },
+    )
+    test.eq(got.value.first.kind, "sql")
+    test.eq(got.value.first.driver, "postgres")
+    test.eq(got.value.first.code, "42P01")
+    test.eq(got.value.second, [{ x: "1" }])
+})
+
+test.case("a nested transaction is refused, and the outer one rolls back", fn() {
+    # BEGIN inside a transaction is only a warning (25001) in Postgres, and the
+    # inner COMMIT would then commit the outer transaction's work early.
+    got = with_server(
+        [
+            complete("BEGIN") + ready(),
+            notice("25001", "there is already a transaction in progress") +
+                complete("BEGIN") +
+                ready(),
+            complete("ROLLBACK") + ready(),
+        ],
+        fn(db) client.transaction(db, fn(tx) client.transaction(tx, fn(inner) 1)),
+    )
+    test.ok(contains(got.error.message, "does not nest"), got.error.message)
+    test.eq(got.seen, ["BEGIN", "BEGIN", "ROLLBACK"])
+})
+
+test.case("a transaction over the wire sends BEGIN, the work, then COMMIT", fn() {
+    got = with_server(
+        [
+            complete("BEGIN") + ready(),
+            complete("INSERT 0 1") + ready(),
+            complete("COMMIT") + ready(),
+        ],
+        fn(db) client.transaction(db, fn(tx) {
+            client.query(tx, "insert into t values (1)")
+            "done"
+        }),
+    )
+    test.eq(got.value, "done")
+    test.eq(got.seen, ["BEGIN", "insert into t values (1)", "COMMIT"])
 })

@@ -4,8 +4,8 @@
 # with SCRAM-SHA-256 authentication built from std.hash + bytes + bitwise (the
 # 4096-round PBKDF2 runs in the interpreter and is still sub-millisecond).
 #
-# The implementation. main.ecko is the entrypoint and re-exports the four
-# public verbs from here; the rest stays internal to the package even though it
+# The implementation. main.ecko is the entrypoint and re-exports the public
+# verbs from here; the rest stays internal to the package even though it
 # is `export`ed, because the offline tests import this file directly to check
 # PBKDF2 and the bind encoding against the published vectors.
 
@@ -28,6 +28,19 @@ fn read_i32(b, off) {
 
 fn read_i16(b, off) = b[off] shl 8 bor b[off + 1]
 
+# --- errors ----------------------------------------------------------------
+
+# Every failure this package raises: std.sql's `sql` kind, so one `catch` arm
+# covers every database, with `driver` saying which one. `code` is the server's
+# SQLSTATE when it sent one (`23505` is a unique violation).
+fn fail(message, code = null) {
+    if is_null(code) {
+        error({ kind: "sql", driver: "postgres", message: message })
+    } else {
+        error({ kind: "sql", driver: "postgres", message: message, code: code })
+    }
+}
+
 # --- message framing -------------------------------------------------------
 # A backend/frontend message is a 1-byte type + Int32 length (length counts
 # itself but not the type byte) + payload. The startup message has no type.
@@ -41,7 +54,7 @@ fn send_msg(sock, typ, payload) {
 # into an error here rather than being indexed into further down.
 fn read_exact_or_fail(sock, n) {
     b = io.read_exact(sock, n)
-    if is_null(b) { error({ kind: "postgres", message: "the server closed the connection" }) }
+    if is_null(b) { fail("the server closed the connection") }
     b
 }
 
@@ -62,11 +75,13 @@ fn field(s, key) {
     if end == -1 { rest } else { rest[0..end] }
 }
 
-# --- ErrorResponse ('E'): null-terminated <fieldtype><value> pairs ----------
+# --- ErrorResponse ('E') / NoticeResponse ('N') -----------------------------
+# Both are null-terminated <fieldtype><value> pairs: M is the message, C the
+# SQLSTATE code.
 
-fn parse_error(payload) {
+fn parse_fields(payload) {
     mut off = 0
-    mut msg = "unknown error"
+    mut out = {}
     while off < len(payload) and payload[off] != 0 {
         code = string(payload[off..off + 1])
         off = off + 1
@@ -74,11 +89,16 @@ fn parse_error(payload) {
         while payload[off] != 0 {
             off = off + 1
         }
-        value = string(payload[start..off])
+        out = insert(out, code, string(payload[start..off]))
         off = off + 1
-        if code == "M" { msg = value }
     }
-    msg
+    out
+}
+
+# Raise an ErrorResponse as this package's error.
+fn fail_response(payload) {
+    f = parse_fields(payload)
+    fail(get(f, "M") ?? "unknown error", get(f, "C"))
 }
 
 # --- SCRAM-SHA-256 ----------------------------------------------------------
@@ -107,7 +127,7 @@ fn authenticate(sock, password) {
     mut authed = false
     while authed == false {
         msg = read_msg(sock)
-        if msg.tag == "E" { error({ kind: "postgres", message: parse_error(msg.payload) }) }
+        if msg.tag == "E" { fail_response(msg.payload) }
         code = read_i32(msg.payload, 0)
         if code == 0 { authed = true } else {
             if code == 10 {
@@ -138,14 +158,7 @@ fn authenticate(sock, password) {
                     if code == 12 {
                         # AuthenticationSASLFinal: server signature (trusted).
                         0
-                    } else {
-                        error(
-                            {
-                                kind: "postgres",
-                                message: "unsupported auth method (code " + string(code) + ")",
-                            },
-                        )
-                    }
+                    } else { fail("unsupported auth method (code " + string(code) + ")") }
                 }
             }
         }
@@ -174,7 +187,7 @@ fn drain_until_ready(sock) {
     while ready == false {
         msg = read_msg(sock)
         if msg.tag == "Z" { ready = true }
-        if msg.tag == "E" { error({ kind: "postgres", message: parse_error(msg.payload) }) }
+        if msg.tag == "E" { fail_response(msg.payload) }
     }
 }
 
@@ -233,21 +246,32 @@ fn parse_row(payload, cols) {
     row
 }
 
-# Read backend messages until ReadyForQuery ('Z'), collecting rows. Shared by
-# the simple and extended query paths (ParseComplete '1' / BindComplete '2' /
-# CommandComplete 'C' / NoData 'n' are read and ignored).
-fn read_results(sock) {
+# Read backend messages until ReadyForQuery ('Z'): the rows, the last
+# CommandComplete tag ("COMMIT", "INSERT 0 1", ...) and the SQLSTATE of every
+# notice. Shared by the simple and extended query paths (ParseComplete '1' /
+# BindComplete '2' / NoData 'n' are read and ignored).
+#
+# An ErrorResponse is raised only once ReadyForQuery has been read. The server
+# always sends one after the error, and raising early left it queued on the
+# socket, where the next query on the connection read it as its own reply.
+fn read_response(sock) {
     mut cols = []
     mut rows = []
+    mut tag = ""
+    mut notices = []
+    mut err = null
     mut done = false
     while done == false {
         msg = read_msg(sock)
         if msg.tag == "T" { cols = parse_columns(msg.payload) }
         if msg.tag == "D" { rows = push(rows, parse_row(msg.payload, cols)) }
+        if msg.tag == "C" { tag = string(msg.payload[0..len(msg.payload) - 1]) }
+        if msg.tag == "N" { notices = push(notices, get(parse_fields(msg.payload), "C") ?? "") }
+        if msg.tag == "E" and is_null(err) { err = msg.payload }
         if msg.tag == "Z" { done = true }
-        if msg.tag == "E" { error({ kind: "postgres", message: parse_error(msg.payload) }) }
     }
-    rows
+    unless is_null(err) { fail_response(err) }
+    { rows: rows, tag: tag, notices: notices }
 }
 
 # --- parameterized queries (extended protocol) -----------------------------
@@ -281,16 +305,195 @@ export fn build_bind(params) {
 
 ## query(sock, sql) runs a simple text query. query(sock, sql, params) runs the
 ## extended protocol with $1..$N placeholders bound out-of-band (injection-safe).
+## A `sql { }` block works in place of the string and the list: its `?`
+## placeholders are numbered for Postgres.
 export fn query(sock, sql, params = []) {
-    if len(params) == 0 {
-        send_msg(sock, "Q", bytes(sql) + b"\x00")
-        return read_results(sock)
+    s = statement(sql, params)
+    if len(s.params) == 0 {
+        send_msg(sock, "Q", bytes(s.sql) + b"\x00")
+        return read_response(sock).rows
     }
     # Parse: unnamed statement, the SQL, 0 declared param types (server infers).
-    send_msg(sock, "P", b"\x00" + bytes(sql) + b"\x00" + i16(0))
-    send_msg(sock, "B", build_bind(params))
+    send_msg(sock, "P", b"\x00" + bytes(s.sql) + b"\x00" + i16(0))
+    send_msg(sock, "B", build_bind(s.params))
     send_msg(sock, "D", bytes("P") + b"\x00")  # Describe the portal
     send_msg(sock, "E", b"\x00" + i32(0))  # Execute, all rows
     send_msg(sock, "S", b"")  # Sync
-    read_results(sock)
+    read_response(sock).rows
+}
+
+## The SQL text and params `query` sends, from either form it takes: a string
+## with `$n` placeholders and a list, sent as written; or a `sql { }` block,
+## whose `?` placeholders become `$1..$N`.
+export fn statement(sql, params) {
+    t = type_of(sql)
+    if t == "string" { return { sql: sql, params: params } }
+    if t != "map" or is_null(get(sql, "query")) {
+        fail("query takes a SQL string or a sql \{ } block, not {t}")
+    }
+    if len(params) > 0 {
+        fail("a sql \{ } block carries its own params; pass it alone, as query(db, sql \{ ... })")
+    }
+    holes = sql.params
+    n = numbered(sql.query)
+    if n.count != len(holes) {
+        fail(
+            "the sql block has {len(holes)} value(s) but its text has {n.count} ? placeholders. A ? that is not a value, such as the jsonb ? operator, cannot be told apart from one in a block: use jsonb_exists(), or a string with $n placeholders",
+        )
+    }
+    { sql: n.sql, params: holes }
+}
+
+## `text` with each `?` placeholder numbered `$1`, `$2`, ..., and how many there
+## were. A `?` inside a string, a quoted name, a comment or a dollar-quoted body
+## is text and stays as it is.
+export fn numbered(text) {
+    cs = chars(text)
+    n = len(cs)
+    mut out = ""
+    mut count = 0
+    mut i = 0
+    while i < n {
+        c = cs[i]
+        if c == "'" {
+            # A string. An E'' string escapes with a backslash; any string
+            # doubles a quote to include one.
+            escapes = i > 0 and (cs[i - 1] == "e" or cs[i - 1] == "E")
+            j = quoted_end(cs, i, "'", escapes)
+            out = out + join(slice(cs, i, j), "")
+            i = j
+        } else if c == "\"" {
+            j = quoted_end(cs, i, "\"", false)
+            out = out + join(slice(cs, i, j), "")
+            i = j
+        } else if c == "-" and i + 1 < n and cs[i + 1] == "-" {
+            mut j = i
+            while j < n and cs[j] != "\n" {
+                j = j + 1
+            }
+            out = out + join(slice(cs, i, j), "")
+            i = j
+        } else if c == "/" and i + 1 < n and cs[i + 1] == "*" {
+            # Postgres block comments nest.
+            mut depth = 0
+            mut j = i
+            mut closed = false
+            while j < n and not closed {
+                if j + 1 < n and cs[j] == "/" and cs[j + 1] == "*" {
+                    depth = depth + 1
+                    j = j + 2
+                } else if j + 1 < n and cs[j] == "*" and cs[j + 1] == "/" {
+                    depth = depth - 1
+                    j = j + 2
+                    if depth == 0 { closed = true }
+                } else { j = j + 1 }
+            }
+            out = out + join(slice(cs, i, j), "")
+            i = j
+        } else if c == "$" and dollar_tag(cs, i) != "" {
+            # $$...$$ or $tag$...$tag$: everything up to the same tag is text.
+            tag = chars(dollar_tag(cs, i))
+            t = len(tag)
+            mut j = i + t
+            mut closed = false
+            while j < n and not closed {
+                if slice(cs, j, min([j + t, n])) == tag {
+                    closed = true
+                    j = j + t
+                } else { j = j + 1 }
+            }
+            out = out + join(slice(cs, i, j), "")
+            i = j
+        } else if c == "?" {
+            count = count + 1
+            out = out + "$" + string(count)
+            i = i + 1
+        } else {
+            out = out + c
+            i = i + 1
+        }
+    }
+    { sql: out, count: count }
+}
+
+# Index just past the quoted run starting at `start`. A doubled quote stays
+# inside it; with `escapes`, so does a backslash and the character after it.
+fn quoted_end(cs, start, q, escapes) {
+    n = len(cs)
+    mut j = start + 1
+    while j < n {
+        if escapes and cs[j] == "\\" {
+            j = j + 2
+        } else if cs[j] == q and j + 1 < n and cs[j + 1] == q {
+            j = j + 2
+        } else if cs[j] == q {
+            return j + 1
+        } else {
+            j = j + 1
+        }
+    }
+    n
+}
+
+# The dollar-quote tag opening at `i` ("$$" or "$name$"), or "" when the `$`
+# there is not one: `$1` is a parameter, and a `$` inside an identifier
+# (`a$b`) is part of the name.
+fn dollar_tag(cs, i) {
+    n = len(cs)
+    if i > 0 and ident_char(cs[i - 1]) { return "" }
+    mut j = i + 1
+    if j < n and contains(DIGITS, cs[j]) { return "" }
+    while j < n and ident_char(cs[j]) {
+        j = j + 1
+    }
+    if j < n and cs[j] == "$" { join(slice(cs, i, j + 1), "") } else { "" }
+}
+
+DIGITS = "0123456789"
+WORD = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_"
+
+# A character that can continue an identifier: ASCII letters, digits and `_`,
+# and anything outside ASCII, which Postgres also allows in a name.
+fn ident_char(c) = contains(WORD, c) or len(bytes(c)) > 1
+
+# --- transactions ----------------------------------------------------------
+
+# Run one statement on the simple protocol and return its command tag.
+fn command(sock, text) {
+    send_msg(sock, "Q", bytes(text) + b"\x00")
+    r = read_response(sock)
+    # 25001: BEGIN inside an open transaction. Postgres only warns and carries
+    # on in the outer one, so a nested transaction() would commit its parent.
+    if contains(r.notices, "25001") {
+        fail("a transaction is already open on this connection; transaction() does not nest")
+    }
+    r.tag
+}
+
+## transaction(db, fn) runs `fn(db)` inside a transaction: it commits when `fn`
+## returns, and rolls back and re-raises if `fn` raises. A commit that fails is
+## rolled back too, and so is one the server turns into a rollback because a
+## statement inside failed; both raise. Returns what `fn` returned.
+export fn transaction(sock, body) = in_transaction(fn(text) command(sock, text), fn() body(sock))
+
+## The transaction protocol, over `run(text) -> command tag`. Internal: it is
+## exported from this file so the offline tests can drive it without a server.
+export fn in_transaction(run, body) {
+    run("BEGIN")
+    result = try { body() } catch (e) {
+        try { run("ROLLBACK") } catch (_) { null }
+        error(e)
+    }
+    tag = try { run("COMMIT") } catch (e) {
+        try { run("ROLLBACK") } catch (_) { null }
+        error(e)
+    }
+    # After a failed statement the transaction is aborted, and COMMIT answers
+    # ROLLBACK rather than failing.
+    if tag == "ROLLBACK" {
+        fail(
+            "the transaction was rolled back, not committed: a statement inside it failed, so nothing it did was saved",
+        )
+    }
+    result
 }
