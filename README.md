@@ -18,7 +18,7 @@ ecko get github.com/ecko-lang/postgresql-client --as postgres
 Without `--as`, `ecko get` records this dependency under the alias
 `postgresql_client` (the repo name with `-` mapped to `_`); `--as postgres` is what makes
 `import postgres` work. It writes the entry as
-`"postgres": "github.com/ecko-lang/postgresql-client@0.38.0"`. Expand it to the map form in
+`"postgres": "github.com/ecko-lang/postgresql-client@0.38.1"`. Expand it to the map form in
 your `ecko.json` to grant the network capability the client needs:
 
 ```json
@@ -26,7 +26,7 @@ your `ecko.json` to grant the network capability the client needs:
   "dependencies": {
     "postgres": {
       "path": "github.com/ecko-lang/postgresql-client",
-      "version": "0.38.0",
+      "version": "0.38.1",
       "grant": ["net"]
     }
   }
@@ -102,6 +102,11 @@ as `t`/`f`, `bytes` as a `\x` bytea literal, `null` as SQL `NULL`); the server
 coerces to each column's type. Without a params list, `query` uses the simple
 protocol as before.
 
+**A parameterized query goes out in one write.** Parse, Bind, Describe, Execute
+and Sync are concatenated and written together, so the query costs one round
+trip. Before 0.38.1 they were five separate writes, and Nagle's algorithm with
+the server's delayed ACK held each query back about 40 ms.
+
 ### `sql { }` blocks
 
 A `sql { }` block is the same `{ query, params }` value `std.sql` takes, with a
@@ -153,8 +158,9 @@ instead, and check `e.driver` if you need to tell databases apart.
 ## Testing
 
 ```bash
-ecko test          # offline: SCRAM vectors, bind encoding, placeholders and
-                   # transactions, partly against a scripted loopback server
+ecko test          # offline: SCRAM vectors, bind and request encoding,
+                   # placeholders and transactions, partly against a scripted
+                   # loopback server
 ecko example.ecko  # live round trip against a PostgreSQL server
 ```
 

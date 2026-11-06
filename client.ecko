@@ -45,9 +45,9 @@ fn fail(message, code = null) {
 # A backend/frontend message is a 1-byte type + Int32 length (length counts
 # itself but not the type byte) + payload. The startup message has no type.
 
-fn send_msg(sock, typ, payload) {
-    io.write(sock, bytes(typ) + i32(len(payload) + 4) + payload)
-}
+fn frame(typ, payload) = bytes(typ) + i32(len(payload) + 4) + payload
+
+fn send_msg(sock, typ, payload) = io.write(sock, frame(typ, payload))
 
 # `io.read_exact` answers null when the peer closed with nothing pending. A
 # backend that goes away mid-conversation is ordinary, so that null is turned
@@ -313,13 +313,23 @@ export fn query(sock, sql, params = []) {
         send_msg(sock, "Q", bytes(s.sql) + b"\x00")
         return read_response(sock).rows
     }
-    # Parse: unnamed statement, the SQL, 0 declared param types (server infers).
-    send_msg(sock, "P", b"\x00" + bytes(s.sql) + b"\x00" + i16(0))
-    send_msg(sock, "B", build_bind(s.params))
-    send_msg(sock, "D", bytes("P") + b"\x00")  # Describe the portal
-    send_msg(sock, "E", b"\x00" + i32(0))  # Execute, all rows
-    send_msg(sock, "S", b"")  # Sync
+    io.write(sock, extended_request(s.sql, s.params))
     read_response(sock).rows
+}
+
+## extended_request(sql, params) -> the bytes `query` sends for a parameterized
+## query: Parse, Bind, Describe, Execute and Sync, concatenated so they go out
+## in one write. Sent as five small writes, they stalled every query for about
+## 40 ms on Nagle's algorithm and delayed ACKs. Internal: exported from this
+## file so the offline tests can check the layout.
+export fn extended_request(sql, params) {
+    # Parse (unnamed statement, the SQL, 0 declared param types: the server
+    # infers them), Bind, Describe the portal, Execute all rows, Sync.
+    frame("P", b"\x00" + bytes(sql) + b"\x00" + i16(0)) +
+        frame("B", build_bind(params)) +
+        frame("D", bytes("P") + b"\x00") +
+        frame("E", b"\x00" + i32(0)) +
+        frame("S", b"")
 }
 
 ## The SQL text and params `query` sends, from either form it takes: a string

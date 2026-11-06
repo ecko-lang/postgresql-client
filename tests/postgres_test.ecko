@@ -319,3 +319,43 @@ test.case("a transaction over the wire sends BEGIN, the work, then COMMIT", fn()
     test.eq(got.value, "done")
     test.eq(got.seen, ["BEGIN", "insert into t values (1)", "COMMIT"])
 })
+
+# --- a parameterized query goes out in one write ----------------------------
+#
+# Parse, Bind, Describe, Execute and Sync used to be five separate writes. Small
+# consecutive writes on a TCP socket meet Nagle's algorithm and the server's
+# delayed ACK, which stalled every parameterized query for about 40 ms.
+
+test.case("extended_request is Parse, Bind, Describe, Execute and Sync back to back", fn() {
+    got = client.extended_request("select $1", [7])
+    want = msg("P", b"\x00" + cstr("select $1") + be16(0)) +
+        msg("B", b"\x00\x00" + be16(0) + be16(1) + be32(1) + b"7" + be16(0)) +
+        msg("D", b"P\x00") +
+        msg("E", b"\x00" + be32(0)) +
+        msg("S", b"")
+    test.eq(got, want)
+})
+
+# Read once, the way a server sees the first segment, then answer the query.
+async fn first_read(listener) {
+    conn = net.accept(listener, 5000)
+    got = io.read(conn, 65536)
+    io.write(conn, one_row("v", "8") + complete("SELECT 1") + ready())
+    io.close(conn)
+    net.stop(listener)
+    got
+}
+
+test.case("a parameterized query reaches the server as one write", fn() {
+    l = net.listen(0, "127.0.0.1")
+    server = first_read(l)
+    sock = net.connect("127.0.0.1", net.port(l))
+    rows = client.query(sock, "select $1::int + 1 as v", [7])
+    io.close(sock)
+    # One write lands whole in the server's first read. With five writes the
+    # first read often held only some of them; that is timing, so this case
+    # catches the old code only sometimes, and the exact-bytes case above is
+    # the deterministic check of the request itself.
+    test.eq(await server, client.extended_request("select $1::int + 1 as v", [7]))
+    test.eq(rows, [{ v: "8" }])
+})
