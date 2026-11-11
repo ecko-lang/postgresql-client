@@ -1,9 +1,9 @@
-# PostgreSQL Client - Ecko Std Lib Package
+# postgresql-client
 
-A PostgreSQL client for [Ecko](https://ecko.sh), written in Ecko. It speaks the v3 wire protocol over `std.net`'s raw sockets and does SCRAM-SHA-256 authentication (Postgres's modern default), built from
-`std.hash`, `bytes`, and the bitwise operators. The PBKDF2 step (4096 rounds
-with Postgres's default settings) runs in the interpreter and takes a few
-milliseconds.
+A PostgreSQL client written in Ecko: the v3 wire protocol and SCRAM-SHA-256
+authentication over `std.net`, with parameterized queries, `sql { }` blocks,
+transactions and affected-row counts. Needs `net`; grant it when you import
+the package.
 
 ## Install
 
@@ -11,159 +11,177 @@ milliseconds.
 ecko get github.com/ecko-lang/postgresql-client --as postgres
 ```
 
-`ecko get` vendors the package under
-`./vendor/github.com/ecko-lang/postgresql-client/` and pins a file-tree hash in
-`ecko.sum`.
-
-Without `--as`, `ecko get` records this dependency under the alias
-`postgresql_client` (the repo name with `-` mapped to `_`); `--as postgres` is what makes
-`import postgres` work. It writes the entry as
-`"postgres": "github.com/ecko-lang/postgresql-client@0.38.1"`. Expand it to the map form in
-your `ecko.json` to grant the network capability the client needs:
+Then grant the network capability in the dependency entry of your `ecko.json`:
 
 ```json
 {
   "dependencies": {
     "postgres": {
       "path": "github.com/ecko-lang/postgresql-client",
-      "version": "0.38.1",
+      "version": "0.39.0",
       "grant": ["net"]
     }
   }
 }
 ```
 
-```ecko
-import postgres
+```ecko norun
+import postgres   # granted net in ecko.json
 ```
 
 ## Usage
 
-```ecko
-import postgres
+```ecko norun
+import postgres   # granted net in ecko.json
 
-db = postgres.connect({
-    host: "127.0.0.1", port: 5432,
-    user: "me", password: "secret", database: "app"
-})                                      # or postgres.connect_tls({ ... })
+db = postgres.connect("127.0.0.1", "app", password: secret("pw"), database: "shop")
 
-rows = postgres.query(db, "select id, name from users order by id")
-for r in rows {                         # rows are maps keyed by column name
-    print("{r.id}: {r.name}")
+# Parameterized: $1..$N bind out-of-band, so a value never changes the SQL.
+n = postgres.exec(db, "insert into users (name) values ($1), ($2)", ["Ada", "Grace"])
+print(n)                                 # 2
+
+rows = postgres.query(db, "select id, name from users where name = $1", ["Ada"])
+for r in rows {
+    print("{r.id}: {r.name}")            # 1: Ada  (every value is text)
 }
 
-# Parameterized query: $1..$N bind out-of-band - injection-safe.
-postgres.query(db, "insert into users (name) values ($1)", ["Ada"])
-me = postgres.query(db, "select * from users where id = $1", [42])
+# A sql { } block: each {hole} is a bound parameter.
+name = "Grace"
+print(postgres.query(db, sql { SELECT count(*) AS n FROM users WHERE name = {name} }))
+# [{n: 1}]
 
-# Or a sql { } block: every {hole} is a bound parameter.
-name = "Ada"
-postgres.query(db, sql { SELECT * FROM users WHERE name = {name} })
-
-# Commits when the function returns; rolls back if it raises.
+# Commits when the function returns; rolls back and re-raises if it raises.
 postgres.transaction(db, fn(tx) {
-    postgres.query(tx, "update accounts set balance = balance - $1 where id = $2", [100, 1])
-    postgres.query(tx, "update accounts set balance = balance + $1 where id = $2", [100, 2])
+    postgres.exec(tx, "update accounts set balance = balance - $1 where id = $2", [100, 1])
+    postgres.exec(tx, "update accounts set balance = balance + $1 where id = $2", [100, 2])
 })
 
 postgres.close(db)
 ```
 
-## API
+### Handling errors
 
-| function | notes |
-|----------|-------|
-| `connect({host, port, user, password, database})` | open + authenticate (SCRAM-SHA-256) |
-| `connect_tls({...})` | same, over TLS |
-| `query(db, sql)` | simple text query; returns a list of row maps (empty for non-SELECT) |
-| `query(db, sql, params)` | **parameterized** query with `$1..$N` placeholders - injection-safe |
-| `query(db, sql { ... })` | a `sql { }` block; its holes are bound parameters |
-| `transaction(db, fn)` | run `fn(db)` in a transaction: commit on return, roll back and re-raise on error; returns what `fn` returned |
-| `close(db)` | close the connection |
+```ecko norun
+import postgres   # granted net in ecko.json
 
-Values come back in text format: integers, text, etc. as strings; SQL
-`NULL` as `null`. Column names are the map keys.
-
-### Parameterized queries
-
-Pass a params list and reference them as `$1`, `$2`, … in the SQL. Each value
-is sent to the server **out-of-band** via the extended query protocol (Parse /
-Bind / Execute), so it is never spliced into the SQL text and can't break out
-of its slot - the same injection-safety guarantee as a `?` placeholder:
-
-```ecko
-name = "Robert'); DROP TABLE students;--"
-postgres.query(db, "insert into students (name) values ($1)", [name])
-# stored as a literal string; no tables were harmed
-```
-
-Params bind in text format (integers/floats/strings verbatim, `true`/`false`
-as `t`/`f`, `bytes` as a `\x` bytea literal, `null` as SQL `NULL`); the server
-coerces to each column's type. Without a params list, `query` uses the simple
-protocol as before.
-
-**A parameterized query goes out in one write.** Parse, Bind, Describe, Execute
-and Sync are concatenated and written together, so the query costs one round
-trip. Before 0.38.1 they were five separate writes, and Nagle's algorithm with
-the server's delayed ACK held each query back about 40 ms.
-
-### `sql { }` blocks
-
-A `sql { }` block is the same `{ query, params }` value `std.sql` takes, with a
-`?` for each hole. `query` numbers those for Postgres (`$1`, `$2`, ...), skipping
-any `?` inside a string, a quoted name, a comment or a dollar-quoted body. Pass
-the block on its own: it carries its params, so a separate list is refused.
-
-**A block cannot use the jsonb `?` operators** (`?`, `?|`, `?&`): a `?` there
-looks like one more placeholder. The count is checked, so this fails with an
-error rather than binding the wrong values. Use `jsonb_exists()` and its
-siblings, or the string form with `$n`, where a `?` is never rewritten.
-
-### Transactions
-
-`transaction(db, fn)` has the same shape as `std.sql`'s. It commits when `fn`
-returns and gives back its value. If `fn` raises, it rolls back and re-raises
-the same error. If the commit fails it rolls back and raises that error.
-
-Postgres aborts a transaction when a statement in it fails, even if `fn`
-caught the error, and then answers `COMMIT` with a rollback. `transaction`
-reports that as an error rather than as success, because nothing was saved.
-Transactions do not nest: starting one inside another on the same connection
-raises.
-
-## Errors
-
-Every failure is `{ kind: "sql", driver: "postgres", message }`, the kind
-`std.sql` raises, so one `catch` arm covers both. An error from the server also
-carries `code`, its SQLSTATE: `23505` is a unique violation, `40001` a
-serialization failure.
-
-```ecko
+db = postgres.connect("127.0.0.1", "app", password: secret("pw"), database: "shop")
+email = "ada@example.com"
 try {
-    postgres.query(db, "insert into users (email) values ($1)", [email])
+    postgres.exec(db, "insert into users (email) values ($1)", [email])
 } catch (e) {
-    match e.kind {
-        "sql" => if e.code == "23505" { print("already registered") } else { error(e) }
-        _ => error(e)
+    if get(e, "kind") == "sql" and get(e, "code") == "23505" {
+        print("already registered")
+    } else {
+        error(e)
     }
 }
 ```
 
-A broken connection reports the same kind. A failed query leaves the connection
-usable for the next one.
+## API
 
-**Migration from 0.37:** errors used to be `kind: "postgres"`. Match `"sql"`
-instead, and check `e.driver` if you need to tell databases apart.
+| function | returns |
+|---|---|
+| `connect(host, user, password: null, database: null, port: 5432)` | a connection handle, authenticated |
+| `connect_tls(host, user, password: null, database: null, port: 5432)` | the same, over TLS |
+| `query(db, sql, params = [])` | the rows, as a list of maps keyed by column name |
+| `exec(db, sql, params = [])` | the number of rows the statement changed, as an Int |
+| `transaction(db, body)` | what `body(db)` returned, committed |
+| `close(db)` | `null`; the connection is closed |
+
+## Notes
+
+### Errors
+
+A failure caused by the server or the network is `kind: "sql"`, the kind
+`std.sql` raises, with `driver: "postgres"`; one `catch` arm covers every
+database. An error the server reported also carries `code`, its SQLSTATE
+(`23505` is a unique violation, `40001` a serialization failure). Read fields
+with `get(e, "code")`: a connection error has no `code`.
+
+| kind | reason | when |
+|---|---|---|
+| `net` | | the server cannot be reached |
+| `sql` | `server_error` | the server rejected the login or the statement; `code` is the SQLSTATE |
+| `sql` | `auth_failed` | the server asks for a password and none was given |
+| `sql` | `auth_unsupported` | the server asks for an auth method other than SCRAM-SHA-256 or trust (MD5, cleartext) |
+| `sql` | `duplicate_column` | two result columns share a name; give one an alias with `AS` |
+| `sql` | `rolled_back` | `transaction`'s commit became a rollback because a statement inside failed |
+| `sql` | `tls_refused` | `connect_tls` asked for TLS and the server does not accept it |
+| `sql` | `closed` | the server closed the connection mid-reply |
+| `sql` | `protocol` | the server sent a message this client cannot parse |
+| `bug` | `bad_argument` | a wrongly typed argument; a list, map or other unsupported parameter; a malformed `sql { }` call; `connect` given a map |
+| `bug` | `nested_transaction` | `transaction` started on a connection already inside one |
+
+A failed query, including a `duplicate_column` one, leaves the connection
+usable for the next one. A failed login closes the socket it opened.
+
+### Parameters
+
+`$1..$N` parameters are sent out-of-band through the extended query protocol
+(Parse, Bind, Describe, Execute, Sync, in one write), never spliced into the
+SQL, so a value cannot break out of its slot. They bind in text format and the
+server converts each to its column's type:
+
+- strings, Ints, Floats and decimals as written; `true`/`false` as `t`/`f`
+- `bytes` as a `\x` bytea literal
+- a `secret` is revealed, so the real value is stored
+- `null` as SQL NULL
+- a list or map is refused: it has no single text form for an array, json or
+  composite column. Encode it yourself, such as `json.encode(v)` for `jsonb`.
+
+Without params, `query` and `exec` use the simple protocol.
+
+### Results
+
+Values come back in text format: numbers and booleans as strings (`"42"`,
+`"t"`), SQL NULL as `null`. The client asks the server for
+`client_encoding=UTF8`, so text arrives as UTF-8 whatever the database's
+encoding; a value that still is not valid UTF-8 (a `SQL_ASCII` database stores
+bytes unchecked) comes back as `bytes` rather than failing the query.
+
+Rows are maps keyed by column name, so a result with two columns of one name
+(`select a.id, b.id ...`) is refused with `duplicate_column` instead of one
+value silently replacing the other.
+
+`exec` reads the count from the server's command tag: `INSERT 0 3` is 3,
+`UPDATE 2` is 2, and a statement whose tag has no count (`CREATE TABLE`) is 0.
+
+### `sql { }` blocks
+
+A `sql { }` block is the same `{ query, params }` value `std.sql` takes, with a
+`?` for each hole. `query` and `exec` number those for Postgres (`$1`, `$2`,
+...), skipping any `?` inside a string, a quoted name, a comment or a
+dollar-quoted body. Pass the block on its own: it carries its params, so a
+separate list is refused.
+
+A block cannot use the jsonb `?` operators (`?`, `?|`, `?&`): a `?` there looks
+like one more placeholder. The count is checked, so this fails rather than
+binding the wrong values. Use `jsonb_exists()` and its siblings, or the string
+form with `$n`, where a `?` is never rewritten.
+
+### Transactions
+
+`transaction(db, body)` has the same shape as `std.sql`'s. Postgres aborts a
+transaction when a statement in it fails, even if `body` caught the error, and
+then answers `COMMIT` with a rollback; `transaction` raises `rolled_back` then,
+because nothing was saved. Transactions do not nest.
+
+### Limits
+
+- Authentication is SCRAM-SHA-256 or trust. MD5 and cleartext password auth
+  are not supported.
+- The server's SCRAM signature (its proof that it knows the password) is not
+  verified. Use `connect_tls` to a server you trust.
+- Values are not converted to Ecko types; `COPY` is not supported.
+- There are no connect or query timeouts.
 
 ## Testing
 
 ```bash
-ecko test          # offline: SCRAM vectors, bind and request encoding,
-                   # placeholders and transactions, partly against a scripted
-                   # loopback server
-ecko example.ecko  # live round trip against a PostgreSQL server
+ecko test          # offline, against known vectors and a scripted loopback server
+ecko example.ecko  # a live round trip; needs a running PostgreSQL server
 ```
 
 ## License
 
-MIT
+[MIT](LICENSE)

@@ -2,14 +2,13 @@
 #
 #   ecko example.ecko
 #
-# (Not part of `ecko test`, which is offline - this needs a running server.)
+# Needs a running PostgreSQL server; it is not part of `ecko test`, which is
+# offline.
 # Edit the connection config for your database.
 
 import "./main.ecko"
 
-db = main.connect(
-    { host: "127.0.0.1", port: 5432, user: "testuser", password: "testpwd", database: "testdb" },
-)
+db = main.connect("127.0.0.1", "testuser", password: secret("testpwd"), database: "testdb")
 print("connected + authenticated (SCRAM-SHA-256)")
 
 version = get(main.query(db, "select version()")[0], "version")
@@ -40,6 +39,12 @@ main.query(db, "insert into ecko_example (name, score) values ($1, $2)", [evil, 
 print(
     "stored hostile name verbatim: " +
         get(main.query(db, "select name from ecko_example where score = $1", [0])[0], "name"),
+)
+
+# exec returns the number of rows a statement changed.
+print(
+    "rows renamed -> " +
+        string(main.exec(db, "update ecko_example set name = upper(name) where score > $1", [90])),
 )
 
 # NULL comes back as null; text and integers as strings (text format).

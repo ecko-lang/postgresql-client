@@ -7,13 +7,14 @@
 # The implementation. main.ecko is the entrypoint and re-exports the public
 # verbs from here; the rest stays internal to the package even though it
 # is `export`ed, because the offline tests import this file directly to check
-# PBKDF2 and the bind encoding against the published vectors.
+# PBKDF2, the bind encoding and the reply parsing against known vectors.
 
 import std.net
 import std.io
 import std.hash
 import std.encoding
 import std.uuid
+import std.str
 
 # --- big-endian integers ---------------------------------------------------
 
@@ -22,28 +23,48 @@ fn i16(n) = bytes([n shr 8 band 255, n band 255])
 
 # Signed read: Postgres uses Int32 -1 (0xFFFFFFFF) for "null" and lengths.
 fn read_i32(b, off) {
+    need(b, off, 4)
     v = b[off] shl 24 bor b[off + 1] shl 16 bor b[off + 2] shl 8 bor b[off + 3]
     if v >= 2147483648 { v - 4294967296 } else { v }
 }
 
-fn read_i16(b, off) = b[off] shl 8 bor b[off + 1]
+fn read_i16(b, off) {
+    need(b, off, 2)
+    b[off] shl 8 bor b[off + 1]
+}
+
+# A message too short for what its own header claims is a protocol error from
+# the server, not a crash in this package.
+fn need(b, off, n) {
+    if off + n > len(b) {
+        fail(
+            "protocol",
+            "the server sent a message too short to parse ({len(b)} bytes, needed {off + n})",
+        )
+    }
+}
 
 # --- errors ----------------------------------------------------------------
 
-# Every failure this package raises: std.sql's `sql` kind, so one `catch` arm
-# covers every database, with `driver` saying which one. `code` is the server's
-# SQLSTATE when it sent one (`23505` is a unique violation).
-fn fail(message, code = null) {
-    if is_null(code) {
-        error({ kind: "sql", driver: "postgres", message: message })
-    } else {
-        error({ kind: "sql", driver: "postgres", message: message, code: code })
-    }
+# Every failure caused by the server or the network: std.sql's `sql` kind, so
+# one `catch` arm covers every database, with `driver` saying which one and
+# `reason` a stable identifier. `code` is the server's SQLSTATE when it sent one
+# (`23505` is a unique violation).
+fn fail(reason, message, code = null) {
+    base = { kind: "sql", driver: "postgres", reason: reason, message: message }
+    if is_null(code) { error(base) } else { error(insert(base, "code", code)) }
 }
+
+# A programmer mistake at the boundary of an exported function.
+fn misuse(message) = error({ kind: "bug", reason: "bad_argument", message: message })
 
 # --- message framing -------------------------------------------------------
 # A backend/frontend message is a 1-byte type + Int32 length (length counts
 # itself but not the type byte) + payload. The startup message has no type.
+
+# Protocol text (names, messages, tags): never fails on bytes that are not
+# UTF-8, which a server can send before `client_encoding` takes effect.
+fn text(b) = str.from_utf8_lossy(b)
 
 fn frame(typ, payload) = bytes(typ) + i32(len(payload) + 4) + payload
 
@@ -54,14 +75,15 @@ fn send_msg(sock, typ, payload) = io.write(sock, frame(typ, payload))
 # into an error here rather than being indexed into further down.
 fn read_exact_or_fail(sock, n) {
     b = io.read_exact(sock, n)
-    if is_null(b) { fail("the server closed the connection") }
+    if is_null(b) { fail("closed", "the server closed the connection") }
     b
 }
 
 fn read_msg(sock) {
     header = read_exact_or_fail(sock, 5)
-    typ = string(header[0..1])
+    typ = text(header[0..1])
     length = read_i32(header, 1)
+    if length < 4 { fail("protocol", "the server sent a message with an invalid length {length}") }
     payload = if length > 4 { read_exact_or_fail(sock, length - 4) } else { b"" }
     { tag: typ, payload: payload }
 }
@@ -69,7 +91,9 @@ fn read_msg(sock) {
 # The value of a "k=v,..." field (SCRAM messages).
 fn field(s, key) {
     p = key + "="
-    start = index_of(s, p) + len(p)
+    at = index_of(s, p)
+    if at == -1 { fail("protocol", "the server's SCRAM message has no {key}= field") }
+    start = at + len(p)
     rest = s[start..len(s)]
     end = index_of(rest, ",")
     if end == -1 { rest } else { rest[0..end] }
@@ -83,13 +107,13 @@ fn parse_fields(payload) {
     mut off = 0
     mut out = {}
     while off < len(payload) and payload[off] != 0 {
-        code = string(payload[off..off + 1])
+        code = text(payload[off..off + 1])
         off = off + 1
         start = off
-        while payload[off] != 0 {
+        while off < len(payload) and payload[off] != 0 {
             off = off + 1
         }
-        out = insert(out, code, string(payload[start..off]))
+        out = insert(out, code, text(payload[start..off]))
         off = off + 1
     }
     out
@@ -98,12 +122,12 @@ fn parse_fields(payload) {
 # Raise an ErrorResponse as this package's error.
 fn fail_response(payload) {
     f = parse_fields(payload)
-    fail(get(f, "M") ?? "unknown error", get(f, "C"))
+    fail("server_error", get(f, "M") ?? "unknown error", get(f, "C"))
 }
 
 # --- SCRAM-SHA-256 ----------------------------------------------------------
 
-## PBKDF2-HMAC-SHA256, single 32-byte block (SCRAM's dkLen).
+# PBKDF2-HMAC-SHA256, single 32-byte block (SCRAM's dkLen).
 export fn pbkdf2(password, salt, iters) {
     mut u = hash.hmac_sha256_bytes(password, salt + b"\x00\x00\x00\x01")
     mut acc = u
@@ -128,8 +152,19 @@ fn authenticate(sock, password) {
     while authed == false {
         msg = read_msg(sock)
         if msg.tag == "E" { fail_response(msg.payload) }
+        if msg.tag != "R" {
+            fail("protocol", "expected an authentication message from the server, got '{msg.tag}'")
+        }
         code = read_i32(msg.payload, 0)
-        if code == 0 { authed = true } else {
+        if code == 0 {
+            authed = true
+        } else {
+            if (code == 3 or code == 5 or code == 10) and is_null(password) {
+                fail(
+                    "auth_failed",
+                    "postgres.connect: the server asks for a password (auth code {code}) and none was given",
+                )
+            }
             if code == 10 {
                 # AuthenticationSASL: send the client-first message.
                 nonce = uuid.v4()
@@ -140,7 +175,7 @@ fn authenticate(sock, password) {
             } else {
                 if code == 11 {
                     # AuthenticationSASLContinue: server-first -> client-final.
-                    server_first = string(msg.payload[4..len(msg.payload)])
+                    server_first = text(msg.payload[4..len(msg.payload)])
                     full_nonce = field(server_first, "r")
                     salt = encoding.base64_decode(field(server_first, "s"))
                     iters = int(field(server_first, "i"))
@@ -156,9 +191,15 @@ fn authenticate(sock, password) {
                     send_msg(sock, "p", bytes(client_final))
                 } else {
                     if code == 12 {
-                        # AuthenticationSASLFinal: server signature (trusted).
+                        # AuthenticationSASLFinal: the server signature. It is
+                        # not verified (see the README's Notes).
                         0
-                    } else { fail("unsupported auth method (code " + string(code) + ")") }
+                    } else {
+                        fail(
+                            "auth_unsupported",
+                            "postgres.connect: the server asked for an authentication method this client does not support (auth code {code}); only SCRAM-SHA-256 and trust are supported",
+                        )
+                    }
                 }
             }
         }
@@ -167,18 +208,19 @@ fn authenticate(sock, password) {
 
 # --- startup + connect -----------------------------------------------------
 
-fn send_startup(sock, user, database) {
-    params = bytes("user") +
-        b"\x00" +
-        bytes(user) +
-        b"\x00" +
-        bytes("database") +
-        b"\x00" +
-        bytes(database) +
-        b"\x00" +
-        b"\x00"
-    body = i32(196608) + params
-    io.write(sock, i32(len(body) + 4) + body)
+# The startup packet: protocol 3.0 and null-terminated name/value pairs.
+# `client_encoding` is always UTF8, so the server converts text to UTF-8 for
+# us whatever the database's own encoding is. With no database the server uses
+# one named after the user.
+export fn startup_message(user, database) {
+    mut pairs = [["user", user], ["client_encoding", "UTF8"]]
+    unless is_null(database) { pairs = push(pairs, ["database", database]) }
+    mut params = b""
+    for (k, v) in pairs {
+        params = params + bytes(k) + b"\x00" + bytes(v) + b"\x00"
+    }
+    body = i32(196608) + params + b"\x00"
+    i32(len(body) + 4) + body
 }
 
 # Read ParameterStatus/BackendKeyData/... until ReadyForQuery ('Z').
@@ -191,46 +233,152 @@ fn drain_until_ready(sock) {
     }
 }
 
-fn handshake(sock, cfg) {
-    send_startup(sock, cfg.user, cfg.database)
-    authenticate(sock, cfg.password)
-    drain_until_ready(sock)
+# Authenticate on an open socket, closing it if anything fails, so a refused
+# login does not leak the connection.
+export fn handshake(sock, user, password, database) {
+    try {
+        io.write(sock, startup_message(user, database))
+        authenticate(sock, password)
+        drain_until_ready(sock)
+    } catch (e) {
+        try { io.close(sock) } catch (_) { null }
+        error(e)
+    }
     sock
 }
 
-## connect({ host, port, user, password, database }) -> a connection handle.
-export fn connect(cfg) = handshake(net.connect(cfg.host, cfg.port), cfg)
-## Connect to PostgreSQL over TLS and complete authentication. Same `cfg` as
-## `connect`. Needs the `net` capability.
-export fn connect_tls(cfg) = handshake(net.connect_tls(cfg.host, cfg.port), cfg)
+# The checks both connect functions make before touching the network.
+fn check_connect(name, host, user, password, database, port) {
+    if type_of(host) == "map" {
+        misuse(
+            "postgres.{name}: takes named arguments, not a map: write postgres.{name}(host, user, password: ..., database: ..., port: 5432)",
+        )
+    }
+    if type_of(host) != "string" {
+        misuse("postgres.{name}: host must be a string, got {type_of(host)}")
+    }
+    if type_of(user) != "string" {
+        misuse("postgres.{name}: user must be a string, got {type_of(user)}")
+    }
+    if type_of(port) != "int" or port < 1 or port > 65535 {
+        misuse("postgres.{name}: port must be an Int from 1 to 65535, got {port}")
+    }
+    pt = type_of(password)
+    if pt != "null" and pt != "string" and pt != "secret" {
+        misuse("postgres.{name}: password must be a string, a secret or null, got {pt}")
+    }
+    if not is_null(database) and type_of(database) != "string" {
+        misuse("postgres.{name}: database must be a string or null, got {type_of(database)}")
+    }
+    if pt == "secret" { reveal(password) } else { password }
+}
+
+## Open a connection to PostgreSQL and authenticate. Returns the connection
+## handle every other function takes.
+##
+## `password` may be a string or a `secret`; leave it `null` for trust auth.
+## With no `database` the server uses the one named after `user`. Text comes
+## back as UTF-8 whatever the database's encoding (the client asks the server
+## for `client_encoding=UTF8`). Authenticates with SCRAM-SHA-256 or trust.
+##
+## errors: `net` when the server cannot be reached; `sql`/`server_error` when
+## the server refuses the login (with `code`); `sql`/`auth_failed` when it asks
+## for a password and none was given; `sql`/`auth_unsupported` for an auth
+## method other than SCRAM-SHA-256 or trust; `sql`/`closed` or `sql`/`protocol`
+## when the connection breaks; `bug`/`bad_argument` for a wrongly typed argument.
+##
+## example:
+##   db = postgres.connect("127.0.0.1", "app", password: secret("pw"), database: "app")
+export fn connect(host, user, password = null, database = null, port = 5432) {
+    pw = check_connect("connect", host, user, password, database, port)
+    handshake(net.connect(host, port), user, pw, database)
+}
+
+## Open a connection to PostgreSQL over TLS and authenticate. Takes the same
+## arguments as `connect`. It sends Postgres's `SSLRequest` first, then
+## upgrades the socket, verifying the server's certificate against the system
+## trust store and `host`.
+##
+## errors: as `connect`, plus `sql`/`tls_refused` when the server does not
+## accept TLS, and `net` when the certificate does not verify.
+##
+## example:
+##   db = postgres.connect_tls("db.example.com", "app", password: secret("pw"))
+export fn connect_tls(host, user, password = null, database = null, port = 5432) {
+    pw = check_connect("connect_tls", host, user, password, database, port)
+    sock = net.connect(host, port)
+    tls = try { upgrade(sock) } catch (e) {
+        try { io.close(sock) } catch (_) { null }
+        error(e)
+    }
+    handshake(tls, user, pw, database)
+}
+
+# SSLRequest: length 8 and the magic code 80877103. The server answers one
+# byte, `S` to go ahead with TLS or `N` to refuse.
+export fn ssl_request() = i32(8) + i32(80877103)
+
+fn upgrade(sock) {
+    io.write(sock, ssl_request())
+    answer = read_exact_or_fail(sock, 1)
+    if answer == b"S" { return net.starttls(sock) }
+    if answer == b"N" {
+        fail("tls_refused", "postgres.connect_tls: the server does not accept TLS connections")
+    }
+    fail("protocol", "postgres.connect_tls: the server answered the TLS request with {answer}")
+}
+
 ## Close the connection.
-export fn close(sock) = io.close(sock)
+##
+## errors: `io` when the socket is already closed.
+export fn close(db) = io.close(db)
 
 # --- simple query ----------------------------------------------------------
 
 # RowDescription ('T'): Int16 field count, then per field a null-terminated
-# name followed by 18 bytes of metadata (OIDs, sizes) we don't need.
-fn parse_columns(payload) {
+# name followed by 18 bytes of metadata (OIDs, sizes) we don't need. Returns
+# the names, or a `duplicate_column` error map (raised by read_response once
+# the reply has been read to the end, so the connection stays usable).
+export fn parse_columns(payload) {
     n = read_i16(payload, 0)
     mut off = 2
     mut cols = []
     mut i = 0
     while i < n {
         start = off
-        while payload[off] != 0 {
+        while off < len(payload) and payload[off] != 0 {
             off = off + 1
         }
-        cols = push(cols, string(payload[start..off]))
+        need(payload, off, 1 + 18)
+        cols = push(cols, text(payload[start..off]))
         off = off + 1 + 18
         i = i + 1
     }
     cols
 }
 
+# The first column name that appears twice, or null.
+fn duplicate(cols) {
+    mut seen = {}
+    for c in cols {
+        if has(seen, c) { return c }
+        seen = insert(seen, c, true)
+    }
+    null
+}
+
+# A value in text format. Text is UTF-8 because the client asks for it; a value
+# that still is not (a SQL_ASCII database stores bytes unchecked) comes back as
+# its exact bytes rather than failing the whole query.
+fn value_of(b) = try { str.from_utf8(b) } catch (_) { b }
+
 # DataRow ('D'): Int16 column count, then per column Int32 length (-1 = null)
 # + value bytes (text format).
-fn parse_row(payload, cols) {
+export fn parse_row(payload, cols) {
     n = read_i16(payload, 0)
+    if n != len(cols) {
+        fail("protocol", "the server sent a row of {n} values for {len(cols)} columns")
+    }
     mut off = 2
     mut row = {}
     mut i = 0
@@ -238,7 +386,8 @@ fn parse_row(payload, cols) {
         vlen = read_i32(payload, off)
         off = off + 4
         if vlen == -1 { row[cols[i]] = null } else {
-            row[cols[i]] = string(payload[off..off + vlen])
+            need(payload, off, vlen)
+            row[cols[i]] = value_of(payload[off..off + vlen])
             off = off + vlen
         }
         i = i + 1
@@ -246,14 +395,23 @@ fn parse_row(payload, cols) {
     row
 }
 
+# The number of rows a command tag reports: the last word of "INSERT 0 5",
+# "UPDATE 3", "DELETE 2", "SELECT 4", "MERGE 1", "COPY 7". A tag with no count
+# ("CREATE TABLE", "BEGIN") is 0.
+export fn affected(tag) {
+    words = split(tag, " ")
+    last = words[len(words) - 1]
+    if last != "" and all(chars(last), fn(c) contains(DIGITS, c)) { int(last) } else { 0 }
+}
+
 # Read backend messages until ReadyForQuery ('Z'): the rows, the last
 # CommandComplete tag ("COMMIT", "INSERT 0 1", ...) and the SQLSTATE of every
 # notice. Shared by the simple and extended query paths (ParseComplete '1' /
 # BindComplete '2' / NoData 'n' are read and ignored).
 #
-# An ErrorResponse is raised only once ReadyForQuery has been read. The server
-# always sends one after the error, and raising early left it queued on the
-# socket, where the next query on the connection read it as its own reply.
+# An error is raised only once ReadyForQuery has been read. The server always
+# sends one after the error, and raising early left it queued on the socket,
+# where the next query on the connection read it as its own reply.
 fn read_response(sock) {
     mut cols = []
     mut rows = []
@@ -263,35 +421,61 @@ fn read_response(sock) {
     mut done = false
     while done == false {
         msg = read_msg(sock)
-        if msg.tag == "T" { cols = parse_columns(msg.payload) }
-        if msg.tag == "D" { rows = push(rows, parse_row(msg.payload, cols)) }
-        if msg.tag == "C" { tag = string(msg.payload[0..len(msg.payload) - 1]) }
+        if msg.tag == "T" {
+            cols = parse_columns(msg.payload)
+            dup = duplicate(cols)
+            if not is_null(dup) and is_null(err) {
+                err = {
+                    reason: "duplicate_column",
+                    message: "the result has two columns named '{dup}'; rows are maps keyed by column name, so give one an alias with AS",
+                }
+            }
+        }
+        if msg.tag == "D" and is_null(err) { rows = push(rows, parse_row(msg.payload, cols)) }
+        if msg.tag == "C" { tag = text(msg.payload[0..max([len(msg.payload) - 1, 0])]) }
         if msg.tag == "N" { notices = push(notices, get(parse_fields(msg.payload), "C") ?? "") }
-        if msg.tag == "E" and is_null(err) { err = msg.payload }
+        if msg.tag == "E" and is_null(err) { err = { response: msg.payload } }
         if msg.tag == "Z" { done = true }
     }
-    unless is_null(err) { fail_response(err) }
+    unless is_null(err) {
+        if has(err, "response") { fail_response(err.response) }
+        fail(err.reason, err.message)
+    }
     { rows: rows, tag: tag, notices: notices }
 }
 
 # --- parameterized queries (extended protocol) -----------------------------
-## Text format for every param: the value goes out-of-band as a length-prefixed
-## field, NEVER spliced into the SQL, so it can't break out of its slot. That's
-## injection safety by construction - the same guarantee as a `?` placeholder.
+
+# Text format for every param: the value goes out-of-band as a length-prefixed
+# field, NEVER spliced into the SQL, so it can't break out of its slot. That's
+# injection safety by construction - the same guarantee as a `?` placeholder.
+# A secret is revealed here, on the wire, and nowhere else. A list or map has
+# no single text form the server would read as the column's type (array,
+# json, composite), so it is refused rather than sent as display text.
 export fn pg_text(v) {
     t = type_of(v)
     if t == "bool" {
         if v { "t" } else { "f" }
     } else if t == "bytes" {
         "\\x" + encoding.hex_encode(v)
-    } else {
+    } else if t == "secret" {
+        pg_text(reveal(v))
+    } else if t == "string" or t == "int" or t == "float" or t == "decimal" {
         string(v)
+    } else if t == "list" or t == "map" {
+        misuse(
+            "postgres: a {t} parameter has no Postgres text form; encode it yourself, for example json.encode(v) for a json or jsonb column, got {v}",
+        )
+    } else {
+        misuse(
+            "postgres: a parameter must be a string, number, bool, bytes, secret or null, got {t}",
+        )
     }
 }
 
-## build_bind(params) -> the Bind ('B') message payload: unnamed portal + unnamed
-## statement + 0 param format codes (all text) + Int16 param count + each param
-## (Int32 length, then bytes; length -1 = SQL NULL) + 0 result format codes.
+# The Bind ('B') message payload: unnamed portal + unnamed statement + 0 param
+# format codes (all text) + Int16 param count + each param (Int32 length, then
+# bytes; length -1 = SQL NULL) + 0 result format codes.
 export fn build_bind(params) {
     mut b = b"\x00" + b"\x00" + i16(0) + i16(len(params))
     for p in params {
@@ -303,25 +487,53 @@ export fn build_bind(params) {
     b + i16(0)
 }
 
-## query(sock, sql) runs a simple text query. query(sock, sql, params) runs the
-## extended protocol with $1..$N placeholders bound out-of-band (injection-safe).
-## A `sql { }` block works in place of the string and the list: its `?`
-## placeholders are numbered for Postgres.
-export fn query(sock, sql, params = []) {
-    s = statement(sql, params)
+# Send one statement, simple or extended protocol, and read its whole reply.
+fn run(sock, name, sql, params) {
+    s = statement(name, sql, params)
     if len(s.params) == 0 {
         send_msg(sock, "Q", bytes(s.sql) + b"\x00")
-        return read_response(sock).rows
+    } else {
+        io.write(sock, extended_request(s.sql, s.params))
     }
-    io.write(sock, extended_request(s.sql, s.params))
-    read_response(sock).rows
+    read_response(sock)
 }
 
-## extended_request(sql, params) -> the bytes `query` sends for a parameterized
-## query: Parse, Bind, Describe, Execute and Sync, concatenated so they go out
-## in one write. Sent as five small writes, they stalled every query for about
-## 40 ms on Nagle's algorithm and delayed ACKs. Internal: exported from this
-## file so the offline tests can check the layout.
+## Run a query and return its rows: a list of maps keyed by column name, empty
+## for a statement that returns none.
+##
+## With `params`, `$1..$N` placeholders in `sql` are bound out-of-band through
+## the extended protocol, so a value can never change the statement. A
+## `sql { }` block works in place of the string and the list: its `?`
+## placeholders are numbered for Postgres. Values come back in text format:
+## numbers and booleans as strings (`"42"`, `"t"`), SQL NULL as `null`, and a
+## value that is not valid UTF-8 as `bytes`.
+##
+## errors: `sql`/`server_error` when the server rejects the statement (with
+## `code`, the SQLSTATE); `sql`/`duplicate_column` when two result columns
+## share a name; `sql`/`closed` or `sql`/`protocol` when the connection breaks;
+## `bug`/`bad_argument` for a parameter that is a list, map or other
+## unsupported type, or a malformed `sql { }` call.
+##
+## example:
+##   rows = postgres.query(db, "select id, name from users where id = $1", [42])
+export fn query(db, sql, params = []) = run(db, "query", sql, params).rows
+
+## Run a statement and return how many rows it changed, as an Int: the count in
+## the server's command tag (`INSERT 0 3` is 3). A statement whose tag carries
+## no count, such as `CREATE TABLE`, returns 0. Takes the same `sql` and
+## `params` forms as `query`; any rows the statement returns are dropped.
+##
+## errors: as `query`.
+##
+## example:
+##   n = postgres.exec(db, "update users set active = $1 where seen < $2", [false, "2026-01-01"])
+export fn exec(db, sql, params = []) = affected(run(db, "exec", sql, params).tag)
+
+# The bytes `query` sends for a parameterized query: Parse, Bind, Describe,
+# Execute and Sync, concatenated so they go out in one write. Sent as five
+# small writes, they stalled every query for about 40 ms on Nagle's algorithm
+# and delayed ACKs. Exported from this file so the offline tests can check the
+# layout.
 export fn extended_request(sql, params) {
     # Parse (unnamed statement, the SQL, 0 declared param types: the server
     # infers them), Bind, Describe the portal, Execute all rows, Sync.
@@ -332,31 +544,36 @@ export fn extended_request(sql, params) {
         frame("S", b"")
 }
 
-## The SQL text and params `query` sends, from either form it takes: a string
-## with `$n` placeholders and a list, sent as written; or a `sql { }` block,
-## whose `?` placeholders become `$1..$N`.
-export fn statement(sql, params) {
+# The SQL text and params `query` sends, from either form it takes: a string
+# with `$n` placeholders and a list, sent as written; or a `sql { }` block,
+# whose `?` placeholders become `$1..$N`.
+export fn statement(name, sql, params) {
+    if type_of(params) != "list" {
+        misuse("postgres.{name}: params must be a list, got {type_of(params)}")
+    }
     t = type_of(sql)
     if t == "string" { return { sql: sql, params: params } }
     if t != "map" or is_null(get(sql, "query")) {
-        fail("query takes a SQL string or a sql \{ } block, not {t}")
+        misuse("postgres.{name}: takes a SQL string or a sql \{ } block, not {t}")
     }
     if len(params) > 0 {
-        fail("a sql \{ } block carries its own params; pass it alone, as query(db, sql \{ ... })")
+        misuse(
+            "postgres.{name}: a sql \{ } block carries its own params; pass it alone, as {name}(db, sql \{ ... })",
+        )
     }
     holes = sql.params
     n = numbered(sql.query)
     if n.count != len(holes) {
-        fail(
-            "the sql block has {len(holes)} value(s) but its text has {n.count} ? placeholders. A ? that is not a value, such as the jsonb ? operator, cannot be told apart from one in a block: use jsonb_exists(), or a string with $n placeholders",
+        misuse(
+            "postgres.{name}: the sql block has {len(holes)} value(s) but its text has {n.count} ? placeholders. A ? that is not a value, such as the jsonb ? operator, cannot be told apart from one in a block: use jsonb_exists(), or a string with $n placeholders",
         )
     }
     { sql: n.sql, params: holes }
 }
 
-## `text` with each `?` placeholder numbered `$1`, `$2`, ..., and how many there
-## were. A `?` inside a string, a quoted name, a comment or a dollar-quoted body
-## is text and stays as it is.
+# `text` with each `?` placeholder numbered `$1`, `$2`, ..., and how many there
+# were. A `?` inside a string, a quoted name, a comment or a dollar-quoted body
+# is text and stays as it is.
 export fn numbered(text) {
     cs = chars(text)
     n = len(cs)
@@ -475,19 +692,39 @@ fn command(sock, text) {
     # 25001: BEGIN inside an open transaction. Postgres only warns and carries
     # on in the outer one, so a nested transaction() would commit its parent.
     if contains(r.notices, "25001") {
-        fail("a transaction is already open on this connection; transaction() does not nest")
+        error(
+            {
+                kind: "bug",
+                reason: "nested_transaction",
+                message: "postgres.transaction: a transaction is already open on this connection; transaction() does not nest",
+            },
+        )
     }
     r.tag
 }
 
-## transaction(db, fn) runs `fn(db)` inside a transaction: it commits when `fn`
-## returns, and rolls back and re-raises if `fn` raises. A commit that fails is
-## rolled back too, and so is one the server turns into a rollback because a
-## statement inside failed; both raise. Returns what `fn` returned.
-export fn transaction(sock, body) = in_transaction(fn(text) command(sock, text), fn() body(sock))
+## Run `body(db)` inside a transaction and return what it returned. It commits
+## when `body` returns, and rolls back and re-raises the same error if `body`
+## raises. A commit that fails is rolled back too, and so is one the server
+## turns into a rollback because a statement inside failed; both raise.
+##
+## errors: whatever `body` raises; `sql`/`rolled_back` when the server rolled
+## the transaction back instead of committing; `bug`/`nested_transaction` when
+## a transaction is already open on `db`; otherwise as `query`.
+##
+## example:
+##   postgres.transaction(db, fn(tx) postgres.exec(tx, "delete from carts where id = $1", [7]))
+export fn transaction(db, body) {
+    if type_of(body) != "function" {
+        misuse(
+            "postgres.transaction: body must be a function taking the connection, got {type_of(body)}",
+        )
+    }
+    in_transaction(fn(text) command(db, text), fn() body(db))
+}
 
-## The transaction protocol, over `run(text) -> command tag`. Internal: it is
-## exported from this file so the offline tests can drive it without a server.
+# The transaction protocol, over `run(text) -> command tag`. Exported from this
+# file so the offline tests can drive it without a server.
 export fn in_transaction(run, body) {
     run("BEGIN")
     result = try { body() } catch (e) {
@@ -502,7 +739,8 @@ export fn in_transaction(run, body) {
     # ROLLBACK rather than failing.
     if tag == "ROLLBACK" {
         fail(
-            "the transaction was rolled back, not committed: a statement inside it failed, so nothing it did was saved",
+            "rolled_back",
+            "postgres.transaction: the transaction was rolled back, not committed: a statement inside it failed, so nothing it did was saved",
         )
     }
     result

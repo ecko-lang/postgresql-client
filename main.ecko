@@ -1,6 +1,7 @@
 # postgres - a PostgreSQL client written in pure Ecko.
 #
 # This entrypoint curates the public surface. Connecting, querying,
-# transactions and closing are the API; the v3 wire encoding and the SCRAM machinery in client.ecko stay
-# internal, so they can change without breaking anyone.
-export { connect, connect_tls, close, query, transaction } from "./client.ecko"
+# transactions and closing are the API; the v3 wire encoding and the SCRAM
+# machinery in client.ecko stay internal, so they can change without breaking
+# anyone.
+export { connect, connect_tls, close, query, exec, transaction } from "./client.ecko"

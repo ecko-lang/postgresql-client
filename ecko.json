@@ -1,6 +1,6 @@
 {
   "module": "github.com/ecko-lang/postgresql-client",
-  "version": "0.38.1",
+  "version": "0.39.0",
   "entrypoint": "main.ecko",
   "description": "A PostgreSQL client written in Ecko: v3 wire protocol + SCRAM-SHA-256 over std.net.",
   "author": "Sean Nieuwoudt <sean@underwulf.com>",
@@ -8,5 +8,6 @@
   "capabilities": [
     "net"
   ],
-  "dependencies": {}
+  "dependencies": {},
+  "ecko": "0.81.0"
 }

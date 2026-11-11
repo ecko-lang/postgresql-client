@@ -61,21 +61,24 @@ test.case("build_bind encodes a null param as length -1", fn() {
     test.eq(got, b"\x00\x00\x00\x00\x00\x01\xff\xff\xff\xff\x00\x00")
 })
 
-# --- one error kind across the SQL drivers ----------------------------------
+# --- error kinds ---------------------------------------------------------------
 #
-# Every failure this package raises is `kind: "sql"`, the kind std.sql raises,
-# with `driver: "postgres"` to say which database it came from. It used to be
-# `kind: "postgres"`, so code catching database errors had to know the driver.
+# A failure from the server or the network is `kind: "sql"`, the kind std.sql
+# raises, with `driver: "postgres"` and a stable `reason`. A mistake in the
+# calling code is `kind: "bug"`, raised at the exported function.
 
 fn kind_of(f) {
     try {
         f()
         null
-    } catch (e) { { kind: e.kind, driver: get(e, "driver") } }
+    } catch (e) { { kind: e.kind, reason: get(e, "reason") } }
 }
 
-test.case("errors are kind sql, with the driver named", fn() {
-    test.eq(kind_of(fn() client.statement(42, [])), { kind: "sql", driver: "postgres" })
+test.case("a statement that is neither a string nor a sql block is a bug", fn() {
+    test.eq(
+        kind_of(fn() client.statement("query", 42, [])),
+        { kind: "bug", reason: "bad_argument" },
+    )
 })
 
 # --- `?` placeholders, for sql { } blocks -------------------------------------
@@ -119,21 +122,25 @@ test.case("numbered leaves an existing $1 alone", fn() {
 test.case("a sql block becomes numbered placeholders with its params", fn() {
     name = "Ada"
     id = 7
-    got = client.statement(sql { SELECT * FROM users WHERE name = {name} AND id > {id} }, [])
+    got = client.statement(
+        "query",
+        sql { SELECT * FROM users WHERE name = {name} AND id > {id} },
+        [],
+    )
     test.eq(got, { sql: "SELECT * FROM users WHERE name = $1 AND id > $2", params: ["Ada", 7] })
 })
 
 test.case("a plain string is sent as written, never rewritten", fn() {
     # The string form already uses $n; a ? in it may be a jsonb operator.
-    got = client.statement("select data ? 'k' from t where id = $1", [3])
+    got = client.statement("query", "select data ? 'k' from t where id = $1", [3])
     test.eq(got, { sql: "select data ? 'k' from t where id = $1", params: [3] })
 })
 
 test.case("a sql block with a separate params list is refused", fn() {
     x = 1
     test.eq(
-        kind_of(fn() client.statement(sql { SELECT {x} }, [2])),
-        { kind: "sql", driver: "postgres" },
+        kind_of(fn() client.statement("query", sql { SELECT {x} }, [2])),
+        { kind: "bug", reason: "bad_argument" },
     )
 })
 
@@ -141,7 +148,7 @@ test.case("a sql block whose ? count does not match its holes is refused", fn() 
     # The jsonb `?` operator reads as a placeholder; refuse rather than misbind.
     k = "key"
     caught = try {
-        client.statement(sql { SELECT data ? 'x' FROM t WHERE k = {k} }, [])
+        client.statement("query", sql { SELECT data ? 'x' FROM t WHERE k = {k} }, [])
     } catch (e) {
         e.message
     }
@@ -358,4 +365,221 @@ test.case("a parameterized query reaches the server as one write", fn() {
     # the deterministic check of the request itself.
     test.eq(await server, client.extended_request("select $1::int + 1 as v", [7]))
     test.eq(rows, [{ v: "8" }])
+})
+
+# --- parameters the client cannot send as text ---------------------------------
+
+test.case("a secret parameter is revealed on the wire, not sent as [secret]", fn() {
+    test.eq(client.pg_text(secret("tok")), "tok")
+    got = client.build_bind([secret("ab")])
+    test.eq(got, b"\x00\x00\x00\x00\x00\x01\x00\x00\x00\x02ab\x00\x00")
+})
+
+test.case("a list or map parameter is refused, not sent as display text", fn() {
+    test.eq(kind_of(fn() client.pg_text([1, 2])), { kind: "bug", reason: "bad_argument" })
+    test.eq(kind_of(fn() client.pg_text({ a: 1 })), { kind: "bug", reason: "bad_argument" })
+    test.eq(kind_of(fn() client.build_bind([[1]])), { kind: "bug", reason: "bad_argument" })
+})
+
+test.case("a decimal parameter is sent exactly", fn() {
+    test.eq(client.pg_text(19.99m), "19.99")
+})
+
+# --- connecting ----------------------------------------------------------------
+
+test.case("the startup message asks for UTF-8 and names the database", fn() {
+    body = be32(196608) +
+        cstr("user") +
+        cstr("app") +
+        cstr("client_encoding") +
+        cstr("UTF8") +
+        cstr("database") +
+        cstr("shop") +
+        b"\x00"
+    test.eq(client.startup_message("app", "shop"), be32(len(body) + 4) + body)
+})
+
+test.case("the startup message leaves the database out when none is given", fn() {
+    body = be32(196608) +
+        cstr("user") +
+        cstr("app") +
+        cstr("client_encoding") +
+        cstr("UTF8") +
+        b"\x00"
+    test.eq(client.startup_message("app", null), be32(len(body) + 4) + body)
+})
+
+test.case("connect takes named arguments; the old map form is a bug", fn() {
+    caught = try {
+        client.connect({ host: "127.0.0.1", port: 5432 }, "u")
+        null
+    } catch (e) { e }
+    test.eq(caught.kind, "bug")
+    test.eq(caught.reason, "bad_argument")
+    test.ok(contains(caught.message, "named arguments"), caught.message)
+    test.eq(
+        kind_of(fn() client.connect("h", "u", port: "5432")),
+        { kind: "bug", reason: "bad_argument" },
+    )
+    test.eq(
+        kind_of(fn() client.connect("h", "u", password: 5)),
+        { kind: "bug", reason: "bad_argument" },
+    )
+})
+
+# Answer the startup packet with `reply` and return what the client sent.
+async fn login_server(listener, reply) {
+    conn = net.accept(listener, 5000)
+    header = io.read_exact(conn, 4)
+    n = header[0] shl 24 bor header[1] shl 16 bor header[2] shl 8 bor header[3]
+    body = io.read_exact(conn, n - 4)
+    io.write(conn, reply)
+    # Wait for the client to hang up (or the next message).
+    rest = try { io.read(conn, 1) } catch (_) { null }
+    io.close(conn)
+    net.stop(listener)
+    { body: body, rest: rest }
+}
+
+fn login(reply, password = null, database = null) {
+    l = net.listen(0, "127.0.0.1")
+    server = login_server(l, reply)
+    out = try {
+        db = client.connect(
+            "127.0.0.1",
+            "app",
+            password: password,
+            database: database,
+            port: net.port(l),
+        )
+        client.close(db)
+        { value: "ok" }
+    } catch (e) { { error: e } }
+    insert(out, "seen", await server)
+}
+
+fn auth(code) = msg("R", be32(code))
+
+test.case("trust auth needs no password and no database", fn() {
+    got = login(auth(0) + msg("S", cstr("client_encoding") + cstr("UTF8")) + ready())
+    test.eq(got.value, "ok")
+    test.ok(not contains(string(got.seen.body), "database"), "no database param was sent")
+})
+
+test.case("a server asking for a password when none was given is auth_failed", fn() {
+    got = login(auth(10) + msg("R", be32(10) + cstr("SCRAM-SHA-256") + b"\x00"))
+    test.eq(got.error.kind, "sql")
+    test.eq(got.error.reason, "auth_failed")
+    test.eq(got.seen.rest, null)
+})
+
+test.case("an unsupported auth method names its code", fn() {
+    got = login(auth(5) + b"salt", password: "pw")
+    test.eq(got.error.reason, "auth_unsupported")
+    test.ok(contains(got.error.message, "auth code 5"), got.error.message)
+})
+
+test.case("a refused login is a server_error carrying the SQLSTATE", fn() {
+    got = login(failure("28P01", "password authentication failed"), password: "pw")
+    test.eq(got.error.kind, "sql")
+    test.eq(got.error.reason, "server_error")
+    test.eq(got.error.code, "28P01")
+})
+
+# --- reading replies -----------------------------------------------------------
+
+fn columns(names) = msg(
+    "T",
+    be16(len(names)) +
+        reduce(names, fn(acc, n) acc + cstr(n) + bytes(range(0, 18) |> map(fn(_) 0)), b""),
+)
+
+fn data_row(values) = msg(
+    "D",
+    be16(len(values)) +
+        reduce(values, fn(acc, v) if is_null(v) { acc + b"\xff\xff\xff\xff" } else { acc + be32(len(v)) + v }, b""),
+)
+
+test.case("two result columns with one name are an error, and the connection survives", fn() {
+    got = with_server(
+        [
+            columns(["id", "id"]) + data_row([b"1", b"2"]) + complete("SELECT 1") + ready(),
+            one_row("x", "1") + complete("SELECT 1") + ready(),
+        ],
+        fn(db) {
+            first = try { client.query(db, "select a.id, b.id from a, b") } catch (e) { e }
+            { first: first, second: client.query(db, "select 1 as x") }
+        },
+    )
+    test.eq(got.value.first.kind, "sql")
+    test.eq(got.value.first.reason, "duplicate_column")
+    test.ok(contains(got.value.first.message, "'id'"), got.value.first.message)
+    test.eq(got.value.second, [{ x: "1" }])
+})
+
+test.case("a value that is not UTF-8 comes back as bytes", fn() {
+    got = with_server(
+        [columns(["v", "n"]) + data_row([b"\xff\xfe", null]) + complete("SELECT 1") + ready()],
+        fn(db) client.query(db, "select v, n from t"),
+    )
+    test.eq(got.value, [{ v: b"\xff\xfe", n: null }])
+})
+
+test.case("a truncated row is a protocol error, not a crash", fn() {
+    got = with_server(
+        [columns(["v"]) + msg("D", be16(1) + be32(10) + b"abc") + complete("SELECT 1") + ready()],
+        fn(db) client.query(db, "select v from t"),
+    )
+    test.eq(got.error.kind, "sql")
+    test.eq(got.error.reason, "protocol")
+})
+
+test.case("exec returns the affected-row count from the command tag", fn() {
+    got = with_server(
+        [
+            complete("INSERT 0 3") + ready(),
+            complete("UPDATE 2") + ready(),
+            complete("CREATE TABLE") + ready(),
+        ],
+        fn(db) [
+            client.exec(db, "insert into t select generate_series(1, 3)"),
+            client.exec(db, "update t set a = 1 where a > 1"),
+            client.exec(db, "create table u (a int)"),
+        ],
+    )
+    test.eq(got.value, [3, 2, 0])
+})
+
+test.case("affected reads the count from every tag shape", fn() {
+    test.eq(client.affected("INSERT 0 5"), 5)
+    test.eq(client.affected("DELETE 0"), 0)
+    test.eq(client.affected("SELECT 12"), 12)
+    test.eq(client.affected("BEGIN"), 0)
+    test.eq(client.affected(""), 0)
+})
+
+# --- TLS -----------------------------------------------------------------------
+
+async fn ssl_server(listener, answer) {
+    conn = net.accept(listener, 5000)
+    got = io.read_exact(conn, 8)
+    io.write(conn, answer)
+    rest = try { io.read(conn, 1) } catch (_) { null }
+    io.close(conn)
+    net.stop(listener)
+    { got: got, rest: rest }
+}
+
+test.case("connect_tls asks with SSLRequest and reports a refusal", fn() {
+    l = net.listen(0, "127.0.0.1")
+    server = ssl_server(l, b"N")
+    caught = try {
+        client.connect_tls("127.0.0.1", "app", port: net.port(l))
+        null
+    } catch (e) { e }
+    seen = await server
+    test.eq(seen.got, b"\x00\x00\x00\x08\x04\xd2\x16\x2f")
+    test.eq(seen.rest, null)
+    test.eq(caught.kind, "sql")
+    test.eq(caught.reason, "tls_refused")
 })
